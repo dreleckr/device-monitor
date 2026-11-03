@@ -1,0 +1,1674 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>Device Monitor v2 — rev2 상세 디버깅</title>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1420; --panel: #171d2d; --panel2: #1e2538; --line: #2a3350;
+      --fg: #dbe3f4; --dim: #7f8aad; --accent: #4aa3ff; --ok: #35d29d;
+      --warn: #ffb454; --err: #ff5c7a; --purple: #b58fff; --cyan: #6fe6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font: 13px/1.4 'Segoe UI', -apple-system, Menlo, monospace;
+      background: var(--bg); color: var(--fg);
+    }
+    header {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+    }
+    header h1 { font-size: 15px; margin: 0; color: var(--accent); }
+    header .badge {
+      padding: 2px 8px; border-radius: 10px; font-size: 11px;
+      background: var(--panel2); border: 1px solid var(--line);
+    }
+    header input, header button, header select {
+      background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+      padding: 4px 8px; border-radius: 4px; font: inherit;
+    }
+    header input[type=text] { min-width: 190px; }
+    header button { cursor: pointer; }
+    header button:hover { border-color: var(--accent); color: var(--accent); }
+    header button.danger:hover { border-color: var(--err); color: var(--err); }
+    header .stat { font-size: 11px; color: var(--dim); }
+    header .stat b { color: var(--fg); font-weight: 600; }
+
+    .status-dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      background: var(--dim); margin-right: 4px; vertical-align: middle;
+    }
+    .status-dot.ok { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+    .status-dot.err { background: var(--err); }
+    @keyframes pulse { 50% { opacity: 0.3; } }
+    .pulsing { animation: pulse 1s infinite; }
+
+    main {
+      display: grid; grid-template-columns: 1fr 480px; gap: 8px;
+      padding: 8px; height: calc(100vh - 48px);
+    }
+    .col { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+    .panel {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+      display: flex; flex-direction: column; min-height: 0;
+    }
+    .panel > .head {
+      padding: 5px 10px; border-bottom: 1px solid var(--line);
+      display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      background: var(--panel2); border-radius: 6px 6px 0 0;
+    }
+    .panel > .head .title { font-weight: 600; color: var(--cyan); }
+    .panel > .head .spacer { flex: 1; }
+    .panel > .body { overflow: auto; flex: 1; min-height: 0; }
+    .panel .head button, .panel .head select, .panel .head input {
+      background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+      padding: 2px 6px; border-radius: 3px; font: inherit; cursor: pointer;
+    }
+    .panel .head button:hover { border-color: var(--accent); color: var(--accent); }
+
+    .chip {
+      display: inline-block; padding: 1px 6px; border-radius: 8px;
+      font-size: 10px; background: var(--panel2); border: 1px solid var(--line); white-space: nowrap;
+    }
+    .chip.status { color: var(--ok); border-color: var(--ok); }
+    .chip.alert { color: var(--warn); border-color: var(--warn); }
+    .chip.cmd { color: var(--purple); border-color: var(--purple); }
+    .chip.ack { color: var(--cyan); border-color: var(--cyan); }
+    .chip.lwt { color: var(--dim); border-color: var(--dim); }
+    .chip.fault { color: var(--err); border-color: var(--err); background: rgba(255,92,122,0.15); font-weight:700; }
+    .chip.replay { color: var(--warn); border-color: var(--warn); background: rgba(255,180,84,0.15); }
+    .chip.mismatch { color: var(--warn); border-color: var(--warn); }
+
+    /* Device grid */
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    thead th {
+      position: sticky; top: 0; background: var(--panel2); z-index: 1;
+      padding: 5px 8px; text-align: left; border-bottom: 1px solid var(--line);
+      color: var(--dim); font-weight: 500;
+    }
+    tbody td { padding: 5px 8px; border-bottom: 1px solid var(--line); }
+    tbody tr:hover { background: rgba(74,163,255,0.06); cursor: pointer; }
+    tbody tr.selected { background: rgba(74,163,255,0.15); }
+    tbody tr.pinned { border-left: 3px solid var(--accent); }
+    tbody tr.fault { background: rgba(255,92,122,0.08); }
+    .did { font-family: Menlo, monospace; color: var(--accent); }
+    .num { font-family: Menlo, monospace; text-align: right; }
+    .prt-cell { display: flex; gap: 3px; flex-wrap: wrap; }
+    .prt {
+      padding: 1px 5px; border-radius: 3px; font-size: 10px;
+      background: var(--panel2); color: var(--dim); border: 1px solid var(--line);
+    }
+    .prt.on { background: rgba(255,92,122,0.15); color: var(--err); border-color: var(--err); }
+    .prt.null { opacity: 0.35; }
+    .rs-on { color: var(--ok); font-weight: 600; }
+    .rs-off { color: var(--dim); }
+
+    /* Log */
+    .log-row {
+      padding: 3px 10px; border-bottom: 1px solid var(--line);
+      font-family: Menlo, monospace; font-size: 11.5px;
+      display: grid; grid-template-columns: 82px 62px 90px 1fr; gap: 6px;
+      align-items: baseline;
+    }
+    .log-row.error { background: rgba(255,92,122,0.08); }
+    .log-row.replay { background: rgba(255,180,84,0.06); }
+    .log-row.invalid-err { background: rgba(255,92,122,0.14); border-left: 3px solid var(--err); }
+    .log-row.invalid-warn { background: rgba(255,180,84,0.10); border-left: 3px solid var(--warn); }
+    .issue-badge {
+      display: inline-block; padding: 1px 6px; margin-left: 4px;
+      border-radius: 3px; font-size: 10px; font-weight: 600; cursor: help;
+    }
+    .issue-badge.err  { background: var(--err);  color: #fff; }
+    .issue-badge.warn { background: var(--warn); color: #000; }
+    .issue-list {
+      margin: 4px 0 2px 0; padding: 6px 8px;
+      background: var(--panel); border-left: 2px solid var(--err); border-radius: 2px;
+      font-size: 10.5px; color: var(--fg);
+    }
+    .issue-list.warn-only { border-left-color: var(--warn); }
+    .issue-list .issue-item { padding: 1px 0; }
+    .issue-list .issue-item.err  { color: var(--err); }
+    .issue-list .issue-item.warn { color: var(--warn); }
+    .issue-list .issue-item b { color: var(--cyan); font-family: Menlo, monospace; }
+    .invalid-badge {
+      display: inline-block; padding: 0 5px; border-radius: 8px;
+      background: var(--err); color: #fff; font-size: 10px; font-weight: 600;
+    }
+    .invalid-badge.warn { background: var(--warn); color: #000; }
+    .chip.dir-srv { background: rgba(74,163,255,0.15); color: var(--accent); border-color: var(--accent); }
+    .chip.dir-dev { background: rgba(53,210,157,0.15); color: var(--ok); border-color: var(--ok); }
+    .log-row .ts { color: var(--dim); }
+    .log-row .payload {
+      white-space: pre-wrap; word-break: break-all; color: var(--fg);
+    }
+    .key { color: var(--cyan); }
+    .str { color: var(--ok); }
+    .num-tok { color: var(--warn); }
+    .bool { color: var(--purple); }
+    .null-tok { color: var(--dim); }
+
+    /* Form */
+    .form { padding: 10px; display: grid; gap: 8px; }
+    .form label { font-size: 11px; color: var(--dim); }
+    .form .row { display: grid; grid-template-columns: 100px 1fr; gap: 8px; align-items: center; }
+    .form input, .form select, .form textarea {
+      background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+      padding: 4px 8px; border-radius: 3px; font: inherit; width: 100%;
+    }
+    .form textarea { font: 12px Menlo, monospace; resize: vertical; }
+    .form .btns { display: flex; gap: 5px; flex-wrap: wrap; }
+    .form button {
+      background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+      padding: 5px 10px; border-radius: 3px; font: inherit; cursor: pointer;
+    }
+    .form button:hover { border-color: var(--accent); color: var(--accent); }
+    .form button.primary { border-color: var(--accent); color: var(--accent); }
+    .form button.danger { border-color: var(--err); color: var(--err); }
+    .form button.warn { border-color: var(--warn); color: var(--warn); }
+    .form .hint { font-size: 10px; color: var(--dim); margin-top: 2px; }
+    .form .cfg-grid {
+      display: grid; grid-template-columns: 50px 1fr; gap: 4px 8px; align-items: center;
+      background: var(--panel2); padding: 8px; border-radius: 4px;
+    }
+    .form .sec {
+      color: var(--cyan); font-weight: 600; padding-top: 4px;
+      border-top: 1px solid var(--line); margin-top: 4px;
+    }
+    .form hr { border: none; border-top: 1px solid var(--line); margin: 2px 0; }
+
+    /* Ack tracker */
+    .ack-row {
+      padding: 5px 10px; border-bottom: 1px solid var(--line);
+      display: grid; grid-template-columns: 60px 30px 1fr 60px; gap: 8px;
+      font-family: Menlo, monospace; font-size: 11.5px; align-items: center;
+    }
+    .ack-row .cid { color: var(--purple); }
+    .ack-row.pending { color: var(--warn); }
+    .ack-row.pending .cid { color: var(--warn); }
+    .ack-row.ok { color: var(--ok); }
+    .ack-row.fail { color: var(--err); background: rgba(255,92,122,0.06); }
+
+    /* Alerts */
+    .alert-row {
+      padding: 5px 10px; border-bottom: 1px solid var(--line);
+      display: grid; grid-template-columns: 82px 55px 60px 1fr auto; gap: 8px;
+      font-size: 11.5px; align-items: baseline;
+    }
+    .alert-row.active { background: rgba(255,92,122,0.06); border-left: 3px solid var(--err); }
+    .alert-row.clear  { border-left: 3px solid var(--ok); }
+    .alert-row .evt { font-weight: 600; }
+
+    /* Cfg diff */
+    .diff-table { width: 100%; }
+    .diff-table th, .diff-table td { padding: 6px 8px; }
+    .diff-row.diff { background: rgba(255,180,84,0.08); }
+    .diff-row.diff td { color: var(--warn); font-weight: 600; }
+    .diff-table .num { font-family: Menlo, monospace; text-align: right; }
+
+    /* Detail */
+    .detail {
+      padding: 10px; font-family: Menlo, monospace; font-size: 11.5px;
+      white-space: pre; overflow: auto;
+    }
+    .empty { padding: 20px; text-align: center; color: var(--dim); }
+
+    /* Tabs */
+    .tabs { display: flex; gap: 2px; }
+    .tabs .tab {
+      padding: 3px 8px; background: var(--panel); color: var(--dim);
+      border: 1px solid var(--line); border-bottom: none; border-radius: 4px 4px 0 0;
+      cursor: pointer; font-size: 12px;
+    }
+    .tabs .tab.active { color: var(--accent); border-color: var(--accent); background: var(--panel2); }
+    .tab-body { display: none; height: 100%; }
+    .tab-body.active { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+
+    /* Rate chart */
+    .rate-bars { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; padding: 8px; }
+    .rate-bar { text-align: center; padding: 6px; background: var(--panel2); border-radius: 4px; }
+    .rate-bar .label { font-size: 10px; color: var(--dim); }
+    .rate-bar .val { font-family: Menlo, monospace; font-weight: 600; font-size: 15px; }
+
+    /* Connection log */
+    .conn-row {
+      padding: 3px 10px; border-bottom: 1px solid var(--line);
+      display: grid; grid-template-columns: 82px 1fr; gap: 8px;
+      font-family: Menlo, monospace; font-size: 11.5px;
+    }
+    .conn-row.err { color: var(--err); }
+    .conn-row.ok { color: var(--ok); }
+
+    kbd {
+      background: var(--panel2); border: 1px solid var(--line); border-radius: 3px;
+      padding: 1px 5px; font-size: 10px; color: var(--dim);
+    }
+
+    @media (max-width: 1100px) {
+      main { grid-template-columns: 1fr; height: auto; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>📡 장비 실시간 모니터</h1>
+  <span class="badge" title="프로토콜 명세서 rev2 기준">rev2</span>
+
+  <span title="MQTT 브로커 주소 (WebSocket)">
+    <input type="text" id="brokerUrl" value="" title="MQTT WebSocket URL">
+    <button id="btnConnect">서버 연결</button>
+    <button id="btnDisconnect" class="danger" disabled>연결 끊기</button>
+  </span>
+
+  <span title="서버 연결 상태"><span class="status-dot" id="connDot"></span><b id="connStat">연결 안됨</b></span>
+
+  <span class="stat" title="현재 관측 중인 장치 수">접속 장치 <b id="statDev">0</b></span>
+  <span class="stat" title="총 수신 메시지 및 최근 1초 수신량">수신 <b id="statMsg">0</b> (<b id="statRate">0</b>건/초)</span>
+  <span class="stat" title="서버가 장치의 응답(ack)을 기다리는 명령 수">응답 대기 <b id="statPending">0</b></span>
+  <span class="stat" title="이 브라우저가 서버에 재접속한 횟수">재접속 <b id="statReconnects">0</b></span>
+  <span class="stat" title="현재 세션 지속 시간">가동시간 <b id="statUptime">-</b></span>
+  <span class="stat" title="장치가 보낸 데이터 중 형식 오류/경고 개수 — 클릭 시 잘못된 데이터 탭"
+        onclick="switchTab('invalid')" style="cursor:pointer">
+    ⚠ 오류 <b id="statInvalid" style="color:var(--err)">0</b>
+    <span style="color:var(--dim)">·</span>
+    경고 <b id="statInvalidWarn" style="color:var(--warn)">0</b>
+  </span>
+  <span class="stat" id="statPin"></span>
+</header>
+
+<main>
+  <!-- LEFT COLUMN -->
+  <div class="col">
+
+    <!-- DEVICES -->
+    <section class="panel" style="flex: 0 0 auto; max-height: 40%;">
+      <div class="head">
+        <span class="title">접속된 장치 목록</span>
+        <span class="chip" id="pinChip" style="display:none">📌 <b id="pinDid"></b> 이 장치만 로그 표시 중</span>
+        <button id="btnUnpin" style="display:none">이 장치 고정 해제</button>
+        <span class="spacer"></span>
+        <button id="btnRefreshDevs" title="서버 REST API 로 장치 목록 다시 조회">↻ 목록 새로고침</button>
+      </div>
+      <div class="body">
+        <table id="devTable">
+          <thead>
+            <tr>
+              <th title="장치 ID (client_id 와 동일)">장치 ID</th>
+              <th title="MQTT 접속 상태 (LWT 기준)">접속</th>
+              <th class="num" title="전압 (V) · 정상 198~242V">전압<br><span style="font-weight:400;color:var(--dim);font-size:10px">V</span></th>
+              <th class="num" title="전류 (A)">전류<br><span style="font-weight:400;color:var(--dim);font-size:10px">A</span></th>
+              <th class="num" title="주파수 (Hz) · 정상 60Hz">주파수<br><span style="font-weight:400;color:var(--dim);font-size:10px">Hz</span></th>
+              <th class="num" title="역률 (Power Factor)">역률</th>
+              <th class="num" title="누설전류 (mA) · 20mA 초과 시 이상">누설<br><span style="font-weight:400;color:var(--dim);font-size:10px">mA</span></th>
+              <th title="릴레이 상태 (on/off)">릴레이</th>
+              <th title="이상감지 (ov 과전압 · uv 부족전압 · oc 과전류 · ld 누설). 활성=적색">이상 감지</th>
+              <th title="기기 자체 고장 플래그 (10.5절)">기기이상</th>
+              <th title="장치에 현재 적용된 설정: txi(송신주기 초) · oc(과전류 A) · ocd(과전류 지연 초) · lcr(누설 복귀 mA)">현재 설정</th>
+              <th title="마지막 데이터 수신 후 경과 시간">최근 수신</th>
+            </tr>
+          </thead>
+          <tbody id="devBody"><tr><td colspan="12" class="empty">장치가 접속되면 여기에 표시됩니다…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- LOG + ALERTS + ACKS + DETAIL + DIFF + CONN + RATE -->
+    <section class="panel" style="flex: 1; min-height: 0;">
+      <div class="head">
+        <div class="tabs" id="tabs">
+          <div class="tab active" data-tab="log" title="MQTT 로 오간 모든 메시지 실시간 표시">실시간 메시지</div>
+          <div class="tab" data-tab="alerts" title="장치가 보낸 이상감지 이벤트 (과전압/부족전압/과전류/누설)">이상 이벤트 <span id="tabAlertCount" class="chip">0</span></div>
+          <div class="tab" data-tab="acks" title="서버가 보낸 명령에 대한 장치의 응답">명령 응답 <span id="tabAckCount" class="chip">0</span></div>
+          <div class="tab" data-tab="detail" title="선택된 장치의 전체 정보">장치 상세</div>
+          <div class="tab" data-tab="diff" title="서버가 원하는 설정과 장치에 실제 적용된 설정 비교">설정 불일치</div>
+          <div class="tab" data-tab="conn" title="연결/재접속/오류 이력">접속 이력</div>
+          <div class="tab" data-tab="rate" title="토픽별 초당 수신량">수신량</div>
+          <div class="tab" data-tab="invalid" title="장치가 보낸 형식 오류 데이터 모음">⚠ 잘못된 데이터 <span id="tabInvalidCount" class="chip">0</span></div>
+        </div>
+        <span class="spacer"></span>
+        <span id="logTools">
+          <input type="text" id="filterInput" placeholder="검색 (장치ID, 토픽, 값...)" style="width:180px" title="입력한 문자열이 포함된 메시지만 표시">
+          <label style="font-size:11px;color:var(--dim)" title="주기 측정 데이터"><input type="checkbox" id="chkStatus" checked> 상태값</label>
+          <label style="font-size:11px;color:var(--dim)" title="이상 발생/복귀 이벤트"><input type="checkbox" id="chkAlert" checked> 이상이벤트</label>
+          <label style="font-size:11px;color:var(--dim)" title="서버→장치 명령"><input type="checkbox" id="chkCmd" checked> 명령</label>
+          <label style="font-size:11px;color:var(--dim)" title="장치→서버 명령 응답"><input type="checkbox" id="chkAck" checked> 응답</label>
+          <label style="font-size:11px;color:var(--dim)" title="장치 온·오프라인 통지 (LWT)"><input type="checkbox" id="chkLwt" checked> 접속상태</label>
+          <label style="font-size:11px;color:var(--err)" title="형식 오류/경고가 있는 메시지만 표시"><input type="checkbox" id="chkOnlyInvalid"> ⚠ 오류만 보기</label>
+          <label style="font-size:11px;color:var(--dim)" title="새 메시지 도착 시 자동으로 맨 위로 스크롤"><input type="checkbox" id="chkAutoscroll" checked> 자동 스크롤</label>
+          <button id="btnPause" title="로그 수신 일시정지 / 재개">⏸</button>
+          <button id="btnClearLog" class="danger" title="로그 화면 지우기">🗑</button>
+          <button id="btnExport" title="현재 세션 JSON 파일로 저장">💾</button>
+        </span>
+      </div>
+      <div class="body">
+        <div id="tab-log" class="tab-body active"><div id="logBody" style="flex:1;overflow:auto"></div></div>
+        <div id="tab-alerts" class="tab-body"><div id="alertBody" style="flex:1;overflow:auto"><div class="empty">이상 이벤트가 아직 없습니다.</div></div></div>
+        <div id="tab-acks" class="tab-body"><div id="ackBody" style="flex:1;overflow:auto"><div class="empty">전송된 명령이 없습니다.</div></div></div>
+        <div id="tab-detail" class="tab-body"><div id="detailBody" class="detail">좌측 표에서 장치를 클릭하세요.</div></div>
+        <div id="tab-diff" class="tab-body"><div id="diffBody" style="flex:1;overflow:auto"><div class="empty">좌측 표에서 장치를 클릭하세요.</div></div></div>
+        <div id="tab-conn" class="tab-body"><div id="connBody" style="flex:1;overflow:auto"><div class="empty">접속 이력이 아직 없습니다.</div></div></div>
+        <div id="tab-rate" class="tab-body"><div id="rateBody" style="flex:1;overflow:auto"></div></div>
+        <div id="tab-invalid" class="tab-body"><div id="invalidBody" style="flex:1;overflow:auto"><div class="empty">형식 오류 데이터가 아직 없습니다.</div></div></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- RIGHT COLUMN: CMD + MANUAL PUB + SESSION -->
+  <div class="col">
+    <section class="panel" style="flex: 1; min-height: 0;">
+      <div class="head">
+        <div class="tabs" id="rTabs">
+          <div class="tab active" data-rtab="cmd" title="장치에 릴레이/설정 명령 전송">명령 전송</div>
+          <div class="tab" data-rtab="manual" title="개발자용 · MQTT 토픽에 임의 데이터 직접 발행">직접 발행 (개발용)</div>
+          <div class="tab" data-rtab="failcode" title="8.1절 오류 코드 재현 테스트">오류 시뮬레이션</div>
+          <div class="tab" data-rtab="session" title="세션 통계 및 초기화">세션 정보</div>
+        </div>
+        <span class="spacer"></span>
+      </div>
+      <div class="body">
+
+        <!-- CMD TAB -->
+        <div id="rtab-cmd" class="tab-body active">
+          <div class="form">
+            <div class="row">
+              <label title="명령을 받을 장치 ID">대상 장치 ID</label>
+              <input type="text" id="cmdDid" value="0001" pattern="[^\s/#+]{1,64}" title="장치 ID (문자열, 공백/슬래시/#/+ 불가)">
+            </div>
+            <div class="row">
+              <label title="REST: 서버가 응답까지 추적 · MQTT: 직접 발행(개발용)">전송 방식</label>
+              <select id="cmdMode">
+                <option value="rest">서버 API 경유 (권장 · 응답 추적됨)</option>
+                <option value="mqtt">MQTT 로 직접 발행 (개발용)</option>
+              </select>
+            </div>
+
+            <div class="sec">릴레이 제어</div>
+            <div class="btns">
+              <button class="primary" onclick="sendRelay('on')" title="릴레이 켜기 (rs=on)">릴레이 ON</button>
+              <button onclick="sendRelay('off')" title="릴레이 끄기 (rs=off)">릴레이 OFF</button>
+            </div>
+
+            <div class="sec">장치 설정 변경</div>
+            <div class="cfg-grid">
+              <label title="txi · status 전송 주기">송신 주기</label>
+              <div>
+                <input type="number" id="cfgTxi" min="5" max="3600" step="1" placeholder="빈칸이면 변경 안 함">
+                <div class="hint">5~3600초 (측정 데이터를 몇 초마다 보낼지)</div>
+              </div>
+              <label title="oc · 과전류 판정 임계값">과전류 임계</label>
+              <div>
+                <input type="text" id="cfgOc" placeholder="예: 8.0  ·  null=감지 끔">
+                <div class="hint">0.1~63.0 A (소수 1자리) · <code>null</code> 입력 시 과전류 감지 비활성화</div>
+              </div>
+              <label title="ocd · 과전류 판정 지속시간">과전류 지연</label>
+              <div>
+                <input type="text" id="cfgOcd" placeholder="예: 5  ·  null=감지 끔">
+                <div class="hint">1~600초 · 과전류가 이 시간만큼 지속돼야 이상으로 판정. 위 임계값과 짝으로 설정</div>
+              </div>
+              <label title="lcr · 누설 정상복귀 임계값">누설 복귀</label>
+              <div>
+                <input type="number" id="cfgLcr" min="1" max="18" step="1" placeholder="빈칸이면 변경 안 함">
+                <div class="hint">1~18 mA · 누설 이상 후 이 값 이하로 3초 지속되면 정상 복귀 판정</div>
+              </div>
+            </div>
+            <div class="btns">
+              <button class="primary" onclick="sendCfg()" title="위 4개 값 중 입력된 것만 장치로 전송">설정 전송</button>
+              <button onclick="sendDisableOc()" title="과전류 임계·지연을 모두 null 로 → 과전류 감지 끄기">과전류 감지 끄기</button>
+              <button onclick="loadCfgFromDevice()" title="선택한 장치의 현재 설정을 위 입력창에 채우기">현재 설정 불러오기</button>
+            </div>
+
+            <div class="sec" title="개발자용 · JSON 을 직접 작성해 전송">JSON 직접 입력</div>
+            <textarea id="rawCmd" rows="4" placeholder='예: {"rs":"on"}   또는   {"cfg":{"txi":10,"oc":10,"ocd":5,"lcr":15}}'></textarea>
+            <div class="btns">
+              <button class="primary" onclick="sendRaw()" title="JSON 그대로 전송">전송</button>
+              <button onclick="prettyRaw()" title="JSON 예쁘게 정렬">보기 좋게</button>
+              <button onclick="testValidation()" title="장치까지 보내지 않고 브라우저에서만 검증">검증만 (전송 안 함)</button>
+            </div>
+
+            <div class="sec" title="서버 REST API 조회 (개발자용)">서버 조회</div>
+            <div class="btns">
+              <button onclick="fetchSpec()" title="서버가 적용 중인 명세 상수 조회">명세 조회</button>
+              <button onclick="fetchDevices()" title="전체 장치 목록 조회">장치 목록</button>
+              <button onclick="fetchDevice()" title="선택 장치의 상세 정보 조회">장치 상세</button>
+              <button onclick="fetchAlerts()" title="선택 장치의 최근 이상 이벤트 조회">최근 이벤트</button>
+            </div>
+
+            <div id="cmdResult" style="margin-top:8px;padding:8px;background:var(--panel2);border-radius:4px;font-family:Menlo,monospace;font-size:11.5px;white-space:pre-wrap;color:var(--dim);min-height:40px;max-height:260px;overflow:auto">전송 후 결과가 여기에 표시됩니다.</div>
+          </div>
+        </div>
+
+        <!-- MANUAL PUBLISH TAB -->
+        <div id="rtab-manual" class="tab-body">
+          <div class="form">
+            <div class="hint" style="background:var(--panel2);padding:8px;border-radius:3px;line-height:1.5">
+              ⚠ 개발자 도구입니다. 임의의 MQTT 토픽에 원하는 데이터를 발행하여 서버 처리 흐름을 테스트합니다.
+            </div>
+            <div class="row"><label title="발행할 MQTT 토픽">토픽</label>
+              <input type="text" id="mpTopic" value="device/0001/status" placeholder="device/{장치ID}/status">
+            </div>
+            <div class="row"><label title="QoS: 0=한번만·1=최소1회보장·2=정확히1회">QoS 등급</label>
+              <select id="mpQos"><option>0</option><option selected>1</option><option>2</option></select>
+            </div>
+            <div class="row"><label title="브로커가 최신값을 저장해두고 새 구독자에게 즉시 전달할지">Retain 저장</label>
+              <input type="checkbox" id="mpRetain" style="width:auto">
+            </div>
+            <label>페이로드 (JSON)</label>
+            <textarea id="mpPayload" rows="10" placeholder='{"did":"0001","st":"online"}'></textarea>
+            <div class="btns">
+              <button class="primary" onclick="manualPublish()">발행</button>
+              <button onclick="prettyManual()" title="JSON 예쁘게 정렬">보기 좋게</button>
+              <button onclick="loadPreset('status')" title="상태 데이터 예시 채우기">예시: 상태 데이터</button>
+              <button onclick="loadPreset('alert')" title="이상 이벤트 예시 채우기">예시: 이상 이벤트</button>
+              <button onclick="loadPreset('lwt-off')" title="오프라인 통지 예시">예시: 오프라인</button>
+              <button onclick="loadPreset('badjson')" title="잘못된 JSON 예시 (파싱 오류 테스트용)">예시: 잘못된 JSON</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- FAIL-CODE TESTS TAB -->
+        <div id="rtab-failcode" class="tab-body">
+          <div class="form">
+            <div class="hint" style="background:var(--panel2);padding:8px;border-radius:3px;line-height:1.5">
+              📖 명세서 8.1절 <b>오류 코드 8종</b>을 각각 재현합니다. 장치·서버가 오류 상황을 올바르게 처리하는지 확인용.
+            </div>
+            <div class="row"><label>대상 장치 ID</label>
+              <input type="text" id="fcDid" value="0001" pattern="[^\s/#+]{1,64}">
+            </div>
+
+            <div class="sec">① 서버가 걸러내는 오류 (장치까지 안 감)</div>
+            <div class="btns">
+              <button onclick="fcSend('UNKNOWN_KEY', {cfg:{foo:1}})" title="정의되지 않은 key">정의 안 된 key</button>
+              <button onclick="fcSend('INVALID_TYPE (txi 문자열)', {cfg:{txi:'10'}})" title="숫자여야 하는 값이 문자열">잘못된 타입</button>
+              <button onclick="fcSend('INVALID_RANGE (lcr=20)', {cfg:{lcr:20}})" title="허용 범위 벗어남">범위 초과</button>
+              <button onclick="fcSend('INVALID_PAIR (oc만)', {cfg:{oc:5}})" title="oc/ocd 짝 안 맞음">oc/ocd 짝 위반</button>
+              <button onclick="fcSend('rs 대문자', {rs:'ON'})" title="rs는 소문자만 허용">rs 대문자</button>
+              <button onclick="fcSend('top-level UNKNOWN_KEY', {foo:'bar'})" title="최상위 정의 안 된 key">최상위 잘못된 key</button>
+            </div>
+
+            <div class="sec">② 장치측 오류 (시뮬레이터에서 강제 유발)</div>
+            <div class="hint">
+              시뮬레이터 콘솔에서 아래 키를 먼저 눌러 &quot;다음 명령을 강제 실패&quot; 상태로 만든 뒤,<br>
+              <b>정상 명령</b>을 전송하면 해당 오류가 응답에 실려 옵니다.<br>
+              <kbd>x</kbd> = NVS 저장 실패 · <kbd>z</kbd> = 릴레이 구동 실패 · <kbd>b</kbd> = 이전 명령 처리 중
+            </div>
+            <div class="btns">
+              <button onclick="fcSend('정상 CMD → 장치 강제 fail 확인', {rs:'on'})">정상 명령 전송</button>
+            </div>
+
+            <div class="sec">③ JSON 파싱 실패</div>
+            <div class="hint">
+              서버 API 는 <code>JSON.parse</code> 시점에 HTTP 400 을 돌려줍니다.
+              장치까지 잘못된 JSON 을 도달시키려면 <b>직접 발행</b> 탭에서
+              토픽 <code>device/0001/cmd</code> 에 <b>잘못된 JSON</b> 예시를 발행하세요.
+            </div>
+
+            <div class="sec">④ 응답 시간 초과 (명세서 7.2절)</div>
+            <div class="hint">오프라인 장치로 명령 → 5초 간격 × 4회 재전송 후 최종 실패 (약 20초)</div>
+            <div class="btns">
+              <button onclick="fcSend('ACK_TIMEOUT', {rs:'on'}, '9999')">없는 장치 9999 로 전송</button>
+            </div>
+
+            <div id="fcResult" style="margin-top:8px;padding:8px;background:var(--panel2);border-radius:4px;font-family:Menlo,monospace;font-size:11.5px;white-space:pre-wrap;color:var(--dim);min-height:40px;max-height:220px;overflow:auto">결과가 여기에 표시됩니다.</div>
+          </div>
+        </div>
+
+        <!-- SESSION TAB -->
+        <div id="rtab-session" class="tab-body">
+          <div class="form">
+            <div class="sec">세션 기록 관리</div>
+            <div class="hint">이 브라우저 탭이 시작된 이후 수신한 모든 메시지와 접속 이벤트를 메모리에 누적합니다.<br>기록은 페이지를 닫으면 사라집니다.</div>
+            <div class="btns">
+              <button onclick="doExport()" title="현재 세션의 모든 데이터를 JSON 파일로 저장">💾 JSON 으로 저장</button>
+              <button class="danger" onclick="doClear()" title="장치 목록·로그·응답·이벤트를 모두 지우고 처음부터 다시 수집">🗑 전체 초기화</button>
+            </div>
+            <div id="sessionStats" style="margin-top:8px;font-family:Menlo,monospace;font-size:12px;color:var(--dim)"></div>
+
+            <div class="sec">브라우저 환경</div>
+            <div id="envInfo" style="font-family:Menlo,monospace;font-size:11.5px;color:var(--dim)"></div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+// ─────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────
+const state = {
+  client: null,
+  devices: {},
+  logs: [],
+  alerts: [],
+  acks: {},          // cid → {did, cmd, sentAt, result, code, message, ackAt}
+  conn: [],          // {ts, kind, msg}
+  selected: null,
+  pinned: null,
+  paused: false,
+  msgCount: 0,
+  msgWindow: [],
+  reconnects: 0,
+  connectedAt: 0,
+  rateBuckets: { status: [], alert: [], cmd: [], ack: [], lwt: [] },
+  invalidLogs: [],     // 검증 이슈가 있는 로그만 (최대 MAX_INVALID)
+  invalidCount: 0,     // 세션 누적 (err+warn)
+  invalidErrCount: 0,  // 세션 누적 (err만)
+};
+const MAX_INVALID = 500;
+
+const MAX_LOG = 3000;
+const MAX_ALERT = 500;
+
+// spec.js 상수 (rev2)
+const FIXED = {
+  overVoltage: { trip: 242, clear: 240 },
+  underVoltage: { trip: 198, clear: 200 },
+  leakage: { trip: 20 },
+};
+const RANGE = {
+  txi: { min: 5, max: 3600, int: true, nullable: false, unit: 'sec' },
+  oc:  { min: 0.1, max: 63.0, int: false, nullable: true, unit: 'A' },
+  ocd: { min: 1, max: 600, int: true, nullable: true, unit: 'sec' },
+  lcr: { min: 1, max: 18, int: true, nullable: false, unit: 'mA' },
+};
+const EVENT_LABEL = { ov: '과전압', uv: '부족전압', oc: '과전류', ld: '누설전류' };
+const LAG_WARN_SEC = 30;
+const ACK_TIMEOUT_MS = 5000;
+const MAX_RETRY = 3;
+
+// 물리적으로 그럴법한 측정값 범위 (범위 밖이면 warn)
+const MEAS_RANGE = {
+  v:  { min: 0,    max: 500,   unit: 'V' },
+  i:  { min: 0,    max: 100,   unit: 'A' },
+  f:  { min: 40,   max: 70,    unit: 'Hz' },
+  pf: { min: -1,   max: 1,     unit: '' },
+  lc: { min: 0,    max: 1000,  unit: 'mA' },
+};
+const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+
+// ─────────────────────────────────────────────────────────────────
+// Payload 검증 (실장비에서 잘못된 값 오는 경우 감지)
+// 반환: [{level:'err'|'warn', field, msg}]
+// ─────────────────────────────────────────────────────────────────
+function validatePayload(kind, body, topicDid) {
+  const issues = [];
+  const err  = (field, msg) => issues.push({ level: 'err',  field, msg });
+  const warn = (field, msg) => issues.push({ level: 'warn', field, msg });
+
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    err('(root)', '페이로드가 객체(JSON object)가 아닙니다');
+    return issues;
+  }
+
+  // 공통: did 존재 / 문자열 / 토픽과 일치
+  if (body.did === undefined) warn('did', '페이로드에 did 없음 (토픽 기준으로 처리됨)');
+  else if (typeof body.did !== 'string') err('did', `did는 문자열이어야 합니다 (실제: ${typeof body.did})`);
+  else if (!/^[^\s/#+]{1,64}$/.test(body.did)) warn('did', `did에 허용되지 않은 문자 포함 (공백/슬래시/#/+ 불가, 1~64자): "${body.did}"`);
+  else if (topicDid && body.did !== topicDid) err('did', `토픽 did(${topicDid}) 와 페이로드 did(${body.did}) 불일치`);
+
+  // 공통: ts 형식 (있으면 ISO 8601 UTC)
+  if (body.ts !== undefined) {
+    if (typeof body.ts !== 'string') err('ts', `ts는 문자열이어야 합니다`);
+    else if (!ISO_UTC_RE.test(body.ts)) err('ts', `ts가 ISO 8601 UTC 형식이 아님 (예: 2026-08-13T07:30:00Z) — 실제: "${body.ts}"`);
+    else {
+      const parsed = Date.parse(body.ts);
+      if (Number.isNaN(parsed)) err('ts', `ts 파싱 불가: "${body.ts}"`);
+      else {
+        const skew = (Date.now() - parsed) / 1000;
+        if (skew < -60) warn('ts', `ts가 서버 시각보다 ${Math.round(-skew)}초 미래 (장치 SNTP 오차 의심)`);
+        else if (skew > 300 && kind !== 'alert') warn('ts', `ts가 ${Math.round(skew)}초 과거 (알림 replay가 아닌데 지연)`);
+      }
+    }
+  } else if (kind === 'status' || kind === 'alert' || kind === 'ack') {
+    warn('ts', `${kind}에 ts가 없음 (SNTP 미동기 상태로 추정 — 서버는 수신시각으로 대체)`);
+  }
+
+  if (kind === 'status') validateStatus(body, err, warn);
+  else if (kind === 'alert') validateAlert(body, err, warn);
+  else if (kind === 'ack') validateAck(body, err, warn);
+  else if (kind === 'lwt') validateLwt(body, err, warn);
+  else if (kind === 'cmd') validateCmdMsg(body, err, warn);
+  // 주의: MQTT 브로커는 발행자를 알려주지 않음. 대시보드가 관측한 cmd 는 서버가 발행한 것이며,
+  // 장치가 발행했는지 여부는 여기서 판단할 수 없음. 따라서 방향(direction) 관련 warn 은 두지 않는다.
+
+  return issues;
+}
+
+// cmd 페이로드 구조 검증 (서버→장치 방향, 명세서 7절)
+function validateCmdMsg(b, err, warn) {
+  if (typeof b.cid !== 'string' || !b.cid) err('cid', 'cid는 비어있지 않은 문자열이어야 함');
+  if (b.cmd === undefined) { err('cmd', 'cmd 본문 누락'); return; }
+  if (!b.cmd || typeof b.cmd !== 'object' || Array.isArray(b.cmd)) { err('cmd', 'cmd는 객체여야 함'); return; }
+  for (const k of Object.keys(b.cmd)) if (k !== 'rs' && k !== 'cfg') err(`cmd.${k}`, `정의되지 않은 최상위 key: ${k}`);
+  if (b.cmd.rs === undefined && b.cmd.cfg === undefined) err('cmd', 'rs 또는 cfg 중 하나는 필수');
+  if (b.cmd.rs !== undefined && b.cmd.rs !== 'on' && b.cmd.rs !== 'off') err('cmd.rs', `rs는 "on"/"off"만 (실제: ${JSON.stringify(b.cmd.rs)})`);
+  if (b.cmd.cfg !== undefined) {
+    if (!b.cmd.cfg || typeof b.cmd.cfg !== 'object' || Array.isArray(b.cmd.cfg)) err('cmd.cfg', 'cfg는 객체여야 함');
+    else for (const [k, v] of Object.entries(b.cmd.cfg)) {
+      const r = RANGE[k];
+      if (!r) { err(`cmd.cfg.${k}`, `정의되지 않은 key: ${k}`); continue; }
+      if (v === null) { if (!r.nullable) err(`cmd.cfg.${k}`, `${k}는 null 불가`); continue; }
+      if (typeof v !== 'number' || !Number.isFinite(v)) err(`cmd.cfg.${k}`, `${k}는 숫자여야 함 (실제: ${JSON.stringify(v)})`);
+      else if (r.int && !Number.isInteger(v)) err(`cmd.cfg.${k}`, `${k}는 정수여야 함`);
+      else if (v < r.min || v > r.max) err(`cmd.cfg.${k}`, `${k}=${v} 범위 위반 (${r.min}~${r.max})`);
+    }
+  }
+}
+
+function validateStatus(b, err, warn) {
+  if (!b.d || typeof b.d !== 'object') { err('d', 'd 블록이 없거나 객체가 아님'); return; }
+  const d = b.d;
+
+  // 측정값
+  for (const [k, r] of Object.entries(MEAS_RANGE)) {
+    if (d[k] === undefined) { err(`d.${k}`, `${k} 측정값 누락`); continue; }
+    if (typeof d[k] !== 'number' || !Number.isFinite(d[k])) {
+      err(`d.${k}`, `${k}는 유한한 숫자여야 합니다 (실제: ${JSON.stringify(d[k])})`);
+      continue;
+    }
+    if (d[k] < r.min || d[k] > r.max) {
+      warn(`d.${k}`, `${k}=${d[k]}${r.unit} 가 물리적 정상범위(${r.min}~${r.max}${r.unit}) 밖`);
+    }
+  }
+
+  // rs
+  if (d.rs === undefined) err('d.rs', 'rs 필드 누락');
+  else if (d.rs !== 'on' && d.rs !== 'off') err('d.rs', `rs는 "on"/"off"만 허용 (실제: ${JSON.stringify(d.rs)})`);
+
+  // prt
+  if (!d.prt || typeof d.prt !== 'object') err('d.prt', 'prt 블록 누락');
+  else {
+    for (const k of ['ov','uv','ld']) {
+      if (d.prt[k] === undefined) err(`d.prt.${k}`, `prt.${k} 누락`);
+      else if (typeof d.prt[k] !== 'boolean') err(`d.prt.${k}`, `prt.${k}는 boolean만 (실제: ${JSON.stringify(d.prt[k])})`);
+    }
+    if (d.prt.oc === undefined) err('d.prt.oc', 'prt.oc 누락 (비활성이면 null)');
+    else if (d.prt.oc !== null && typeof d.prt.oc !== 'boolean') err('d.prt.oc', `prt.oc는 boolean 또는 null (실제: ${JSON.stringify(d.prt.oc)})`);
+  }
+
+  // cfg
+  if (!d.cfg || typeof d.cfg !== 'object') err('d.cfg', 'cfg 블록 누락 (rev2 신설 · 4.절 필수)');
+  else {
+    for (const [k, r] of Object.entries(RANGE)) {
+      if (d.cfg[k] === undefined) err(`d.cfg.${k}`, `cfg.${k} 누락`);
+      else if (d.cfg[k] === null) {
+        if (!r.nullable) err(`d.cfg.${k}`, `cfg.${k}는 null을 허용하지 않음`);
+      } else if (typeof d.cfg[k] !== 'number' || !Number.isFinite(d.cfg[k])) {
+        err(`d.cfg.${k}`, `cfg.${k}는 숫자여야 함 (실제: ${JSON.stringify(d.cfg[k])})`);
+      } else if (r.int && !Number.isInteger(d.cfg[k])) {
+        err(`d.cfg.${k}`, `cfg.${k}는 정수여야 함 (실제: ${d.cfg[k]})`);
+      } else if (d.cfg[k] < r.min || d.cfg[k] > r.max) {
+        err(`d.cfg.${k}`, `cfg.${k}=${d.cfg[k]} 범위 위반 (${r.min}~${r.max})`);
+      }
+    }
+    // oc/ocd 짝
+    if (d.cfg.oc !== undefined && d.cfg.ocd !== undefined) {
+      const ocN = d.cfg.oc === null, ocdN = d.cfg.ocd === null;
+      if (ocN !== ocdN) err('d.cfg', 'oc/ocd는 함께 설정하거나 함께 null이어야 함 (INVALID_PAIR)');
+    }
+    // prt.oc 와 cfg 정합성
+    if (d.prt && d.cfg) {
+      const ocEnabled = d.cfg.oc !== null && d.cfg.ocd !== null;
+      if (ocEnabled && d.prt.oc === null) err('d.prt.oc', 'cfg는 활성인데 prt.oc가 null — 장치측 정합성 오류');
+      if (!ocEnabled && d.prt.oc !== null) err('d.prt.oc', 'cfg는 비활성인데 prt.oc가 null 아님 — 장치측 정합성 오류');
+    }
+  }
+
+  if (d.flt !== undefined && typeof d.flt !== 'boolean') err('d.flt', `flt는 boolean만 (실제: ${JSON.stringify(d.flt)})`);
+}
+
+function validateAlert(b, err, warn) {
+  if (b.evt === undefined) err('evt', 'evt 누락');
+  else if (!['ov','uv','oc','ld'].includes(b.evt)) err('evt', `evt는 ov/uv/oc/ld 중 하나 (실제: ${JSON.stringify(b.evt)})`);
+  if (b.st === undefined) err('st', 'st 누락');
+  else if (b.st !== 'active' && b.st !== 'clear') err('st', `st는 active/clear만 (실제: ${JSON.stringify(b.st)})`);
+  if (b.val === undefined) err('val', 'val 누락');
+  else if (typeof b.val !== 'number' || !Number.isFinite(b.val)) err('val', `val은 숫자여야 함 (실제: ${JSON.stringify(b.val)})`);
+  if (b.th === undefined) err('th', 'th 누락');
+  else if (typeof b.th !== 'number' || !Number.isFinite(b.th)) err('th', `th는 숫자여야 함 (실제: ${JSON.stringify(b.th)})`);
+  if (b.rs === undefined) warn('rs', 'rs 누락 (6절 · alert 시점 릴레이 상태 권장)');
+  else if (b.rs !== 'on' && b.rs !== 'off') err('rs', `rs는 on/off만 (실제: ${JSON.stringify(b.rs)})`);
+}
+
+function validateAck(b, err, warn) {
+  if (typeof b.cid !== 'string' || !b.cid) err('cid', 'cid는 비어있지 않은 문자열이어야 함');
+  if (b.result === undefined) err('result', 'result 누락');
+  else if (b.result !== 'success' && b.result !== 'fail') err('result', `result는 success/fail만 (실제: ${JSON.stringify(b.result)})`);
+  if (b.result === 'fail') {
+    if (!b.code) err('code', 'fail 시 code 필수 (8.1절)');
+    else if (!['INVALID_JSON','UNKNOWN_KEY','INVALID_TYPE','INVALID_RANGE','INVALID_PAIR','NVS_WRITE_FAIL','RELAY_FAIL','BUSY'].includes(b.code)) {
+      warn('code', `정의되지 않은 code: "${b.code}" (8.1절 목록 외)`);
+    }
+  } else if (b.code) {
+    warn('code', 'success인데 code가 있음');
+  }
+}
+
+function validateLwt(b, err, warn) {
+  if (b.st === undefined) err('st', 'st 누락');
+  else if (b.st !== 'online' && b.st !== 'offline') err('st', `lwt.st는 online/offline만 (실제: ${JSON.stringify(b.st)})`);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+// 페이지가 열린 호스트를 기준으로 브로커 URL 자동 세팅 (file:// 이면 localhost)
+$('brokerUrl').value = `ws://${location.hostname || 'localhost'}:30001`;
+const restBase = () => {
+  const u = new URL($('brokerUrl').value.replace(/^ws/, 'http'));
+  return `${u.protocol}//${u.host}`;
+};
+const nowHms = () => new Date().toISOString().substr(11, 12);
+const ageStr = (iso) => {
+  if (!iso) return '-';
+  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s/60)}m${s%60}s`;
+  return `${Math.floor(s/3600)}h`;
+};
+
+function highlightJson(obj) {
+  const s = JSON.stringify(obj);
+  return s.replace(/"([^"]+)":/g, '<span class="key">"$1"</span>:')
+          .replace(/:"([^"]*)"/g, ':<span class="str">"$1"</span>')
+          .replace(/:(-?\d+\.?\d*)/g, ':<span class="num-tok">$1</span>')
+          .replace(/:(true|false)/g, ':<span class="bool">$1</span>')
+          .replace(/:null/g, ':<span class="null-tok">null</span>');
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+function parseTopic(topic) {
+  const m = /^device\/([^/]+)\/(status|alert|cmd|ack|lwt)$/.exec(topic);
+  return m ? { did: m[1], kind: m[2] } : null;
+}
+function connLog(kind, msg) {
+  const e = { ts: nowHms(), kind, msg };
+  state.conn.unshift(e);
+  if (state.conn.length > 300) state.conn.length = 300;
+  renderConn();
+}
+function toast(target, msg, kind) {
+  const el = $(target);
+  el.style.color = kind === 'err' ? 'var(--err)' : kind === 'ok' ? 'var(--ok)' : 'var(--dim)';
+  el.textContent = msg;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MQTT
+// ─────────────────────────────────────────────────────────────────
+function connect() {
+  const url = $('brokerUrl').value.trim();
+  if (state.client) { state.client.end(true); state.client = null; }
+
+  $('connStat').textContent = 'Connecting…';
+  $('connDot').className = 'status-dot';
+  connLog('conn', `연결 시도: ${url}`);
+
+  const client = mqtt.connect(url, {
+    clientId: 'devmon-' + Math.random().toString(16).slice(2, 8),
+    keepalive: 60,
+    reconnectPeriod: 3000,
+    clean: true,
+  });
+
+  client.on('connect', () => {
+    $('connStat').textContent = '연결됨';
+    $('connDot').className = 'status-dot ok';
+    $('btnConnect').disabled = true;
+    $('btnDisconnect').disabled = false;
+    state.connectedAt = Date.now();
+    client.subscribe(['device/+/status','device/+/alert','device/+/cmd','device/+/ack','device/+/lwt'], { qos: 1 });
+    connLog('ok', '서버 연결 성공 · 5종 토픽(status/alert/cmd/ack/lwt) 구독 시작');
+  });
+  client.on('reconnect', () => {
+    state.reconnects++;
+    $('statReconnects').textContent = state.reconnects;
+    $('connStat').textContent = '재접속 중…';
+    $('connDot').className = 'status-dot';
+    connLog('conn', `재접속 시도 (누적 ${state.reconnects}회)`);
+  });
+  client.on('close', () => {
+    $('connStat').textContent = '연결 끊김';
+    $('connDot').className = 'status-dot err';
+    $('btnConnect').disabled = false;
+    $('btnDisconnect').disabled = true;
+    connLog('err', '연결 종료');
+  });
+  client.on('offline', () => connLog('err', '오프라인'));
+  client.on('error', (e) => {
+    pushLog({ kind: 'sys', topic: '(error)', payload: e.message, error: true, did: '-' });
+    connLog('err', `오류: ${e.message}`);
+  });
+
+  client.on('message', (topic, buf, packet) => {
+    if (state.paused) return;
+    const raw = buf.toString();
+    const t = parseTopic(topic);
+    let body = null, parseErr = null;
+    try { body = JSON.parse(raw); } catch (e) { parseErr = e.message; }
+
+    const recvAt = new Date().toISOString();
+    let lagSec = 0, buffered = false;
+    if (body && body.ts && (t?.kind === 'alert' || t?.kind === 'status')) {
+      lagSec = Math.floor((Date.now() - Date.parse(body.ts)) / 1000);
+      if (t.kind === 'alert' && lagSec > LAG_WARN_SEC) buffered = true;
+    }
+
+    // 페이로드 검증 (실장비 잘못된 값 감지)
+    let issues = [];
+    if (parseErr) {
+      issues = [{ level: 'err', field: '(json)', msg: 'JSON 파싱 실패: ' + parseErr }];
+    } else if (!t) {
+      issues = [{ level: 'err', field: '(topic)', msg: `알 수 없는 토픽 규칙: "${topic}" (device/{did}/{status|alert|cmd|ack|lwt} 형식이어야 함)` }];
+    } else {
+      issues = validatePayload(t.kind, body, t.did);
+    }
+    const hasErr  = issues.some((x) => x.level === 'err');
+    const hasWarn = issues.some((x) => x.level === 'warn');
+
+    const entry = {
+      ts: nowHms(), recvAt, topic, kind: t ? t.kind : 'unknown',
+      did: t ? t.did : '-', payload: body, raw,
+      retain: packet.retain, qos: packet.qos,
+      error: !!parseErr, parseErr,
+      lagSec, buffered,
+      issues, hasErr, hasWarn,
+    };
+    pushLog(entry);
+    if (t) state.rateBuckets[t.kind]?.push(Date.now());
+
+    // 검증 이슈 집계 (장치별 · 세션 누적)
+    if (issues.length) {
+      state.invalidCount++;
+      if (hasErr) state.invalidErrCount++;
+      state.invalidLogs.unshift(entry);
+      if (state.invalidLogs.length > MAX_INVALID) state.invalidLogs.length = MAX_INVALID;
+      if (t) {
+        const dev = ensureDev(t.did);
+        dev.invalidCount = (dev.invalidCount || 0) + 1;
+        if (hasErr) dev.invalidErrCount = (dev.invalidErrCount || 0) + 1;
+        dev.lastInvalidAt = recvAt;
+      }
+      // 헤더 카운터 즉시 갱신 + 연결로그
+      $('statInvalid').textContent = state.invalidErrCount;
+      $('statInvalidWarn').textContent = state.invalidCount - state.invalidErrCount;
+      if (hasErr) connLog('err', `[${t?t.did:'-'}] ${t?t.kind:'?'} 검증 실패: ${issues.filter(x=>x.level==='err').map(x=>x.field+' '+x.msg).join(' | ')}`);
+    }
+
+    if (parseErr || !t) return;
+
+    switch (t.kind) {
+      case 'status': applyStatus(t.did, body); break;
+      case 'alert':  applyAlert(t.did, body, entry); break;
+      case 'lwt':    applyLwt(t.did, body); break;
+      case 'ack':    applyAck(t.did, body); break;
+      case 'cmd':    /* server publishes */ break;
+    }
+  });
+
+  state.client = client;
+}
+
+function disconnect() {
+  if (state.client) { state.client.end(true); state.client = null; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Apply payloads
+// ─────────────────────────────────────────────────────────────────
+function ensureDev(did) {
+  if (!state.devices[did]) {
+    state.devices[did] = { did, online: null, lastSeen: null, lastStatus: null, alerts: 0 };
+  }
+  return state.devices[did];
+}
+
+function applyStatus(did, body) {
+  const d = ensureDev(did);
+  d.lastSeen = body.ts || new Date().toISOString();
+  d.lastStatus = body.d;
+  if (body.d) {
+    d.rs = body.d.rs;
+    d.prt = body.d.prt;
+    d.cfg = body.d.cfg;
+    if (body.d.flt !== undefined) {
+      if (d.flt !== body.d.flt) {
+        connLog(body.d.flt ? 'err' : 'ok', `[${did}] 기기 자체 이상 ${body.d.flt ? '★ 발생' : '해제'} (10.5절)`);
+      }
+      d.flt = body.d.flt;
+    } else if (d.flt === true) {
+      // flt 필드 사라지면 해제로 간주
+      d.flt = false;
+      connLog('ok', `[${did}] 기기 자체 이상 해제`);
+    }
+  }
+  if (d.online === null) d.online = true;
+  renderDevices();
+  if (state.selected === did) { renderDetail(); renderDiff(); }
+}
+
+function applyAlert(did, body, entry) {
+  const d = ensureDev(did);
+  d.alerts = (d.alerts || 0) + 1;
+  const a = {
+    ts: nowHms(), did, evt: body.evt, st: body.st, val: body.val, th: body.th, rs: body.rs,
+    iso: body.ts, lagSec: entry.lagSec, buffered: entry.buffered,
+  };
+  state.alerts.unshift(a);
+  if (state.alerts.length > MAX_ALERT) state.alerts.length = MAX_ALERT;
+  renderAlerts(); renderDevices();
+  if (a.buffered) connLog('conn', `[${did}] 버퍼링된 alert 도착 (지연 ${a.lagSec}s) — 6.1절`);
+}
+
+function applyLwt(did, body) {
+  const d = ensureDev(did);
+  const prev = d.online;
+  d.online = body.st === 'online';
+  if (prev !== d.online) connLog(d.online ? 'ok' : 'err', `[${did}] 접속상태 → ${body.st === 'online' ? '온라인' : '오프라인'}`);
+  renderDevices();
+}
+
+function applyAck(did, body) {
+  const a = state.acks[body.cid] || { cid: body.cid, did, sentAt: null, cmd: null };
+  a.result = body.result;
+  a.code = body.code;
+  a.message = body.message;
+  a.ackAt = Date.now();
+  state.acks[body.cid] = a;
+  renderAcks();
+  renderPendingCount();
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Log
+// ─────────────────────────────────────────────────────────────────
+function pushLog(e) {
+  state.logs.unshift(e);
+  if (state.logs.length > MAX_LOG) state.logs.length = MAX_LOG;
+  state.msgCount++;
+  state.msgWindow.push(Date.now());
+  appendLogRow(e);
+}
+
+function filterMatch(e) {
+  if (state.pinned && e.did !== state.pinned && e.did !== '-') return false;
+  if ($('chkOnlyInvalid').checked && !(e.hasErr || e.hasWarn || e.error)) return false;
+  const f = $('filterInput').value.trim().toLowerCase();
+  if (f) {
+    const hay = `${e.topic} ${e.raw || ''}`.toLowerCase();
+    if (!hay.includes(f)) return false;
+  }
+  if (e.kind === 'status' && !$('chkStatus').checked) return false;
+  if (e.kind === 'alert'  && !$('chkAlert').checked) return false;
+  if (e.kind === 'cmd'    && !$('chkCmd').checked) return false;
+  if (e.kind === 'ack'    && !$('chkAck').checked) return false;
+  if (e.kind === 'lwt'    && !$('chkLwt').checked) return false;
+  return true;
+}
+
+function appendLogRow(e) {
+  if (!filterMatch(e)) return;
+  const body = $('logBody');
+  const row = document.createElement('div');
+  const cls = ['log-row'];
+  if (e.error) cls.push('error');
+  if (e.buffered) cls.push('replay');
+  if (e.hasErr) cls.push('invalid-err');
+  else if (e.hasWarn) cls.push('invalid-warn');
+  row.className = cls.join(' ');
+  const KIND_LABEL = { status: '상태값', alert: '이상이벤트', cmd: '명령', ack: '응답', lwt: '접속상태' };
+  const kindChip = e.kind && e.kind !== 'sys'
+    ? `<span class="chip ${e.kind}" title="원본 토픽 종류: ${e.kind}">${KIND_LABEL[e.kind] || e.kind}</span>`
+    : `<span class="chip">시스템</span>`;
+  // 방향 표시 — cmd 는 서버→장치, 나머지(status/alert/ack/lwt)는 장치→서버
+  // MQTT 브로커는 발행자를 노출하지 않으므로 이는 프로토콜 규약상의 방향임
+  let dirChip = '';
+  if (e.kind === 'cmd') dirChip = ' <span class="chip dir-srv" title="서버 → 장치 방향의 명령. 대시보드는 관측용으로 구독하고 있어 여기에도 보입니다.">서버→장치</span>';
+  else if (e.kind === 'status' || e.kind === 'alert' || e.kind === 'ack' || e.kind === 'lwt')
+    dirChip = ' <span class="chip dir-dev" title="장치가 서버로 발행한 데이터">장치→서버</span>';
+  const qos = e.qos !== undefined ? ` <span class="chip">Q${e.qos}</span>` : '';
+  const ret = e.retain ? ` <span class="chip">R</span>` : '';
+  const rep = e.buffered ? ` <span class="chip replay" title="장치가 통신 두절 중 버퍼링했다가 재접속 후 재전송한 데이터 (명세서 6.1절)">지연 ${e.lagSec}초</span>` : '';
+  let issueBadge = '';
+  if (e.issues && e.issues.length) {
+    const errN = e.issues.filter((x) => x.level === 'err').length;
+    const warnN = e.issues.length - errN;
+    const tip = e.issues.map((x) => `[${x.level.toUpperCase()}] ${x.field}: ${x.msg}`).join('\n');
+    if (errN)  issueBadge += ` <span class="issue-badge err" title="${escapeHtml(tip)}">⚠ 오류 ${errN}</span>`;
+    if (warnN) issueBadge += ` <span class="issue-badge warn" title="${escapeHtml(tip)}">⚠ 경고 ${warnN}</span>`;
+  }
+  const payloadHtml = e.error
+    ? `<span style="color:var(--err)">JSON 파싱 실패: ${escapeHtml(e.parseErr)} · raw=${escapeHtml(e.raw||'')}</span>`
+    : (e.payload !== undefined && e.payload !== null) ? highlightJson(e.payload) : escapeHtml(String(e.payload));
+  let issueListHtml = '';
+  if (e.issues && e.issues.length) {
+    const listCls = e.hasErr ? '' : 'warn-only';
+    issueListHtml = `<div class="issue-list ${listCls}">`
+      + e.issues.map((x) => `<div class="issue-item ${x.level}"><b>${escapeHtml(x.field)}</b> — ${escapeHtml(x.msg)}</div>`).join('')
+      + '</div>';
+  }
+  row.innerHTML = `
+    <span class="ts">${e.ts}</span>
+    <span class="did">${e.did}</span>
+    <span>${kindChip}${dirChip}${qos}${ret}${rep}${issueBadge}</span>
+    <span class="payload">${payloadHtml}${issueListHtml}</span>`;
+  body.prepend(row);
+  while (body.childNodes.length > MAX_LOG) body.lastChild.remove();
+  if ($('chkAutoscroll').checked) body.scrollTop = 0;
+}
+
+function rerenderLog() {
+  $('logBody').innerHTML = '';
+  for (let i = state.logs.length - 1; i >= 0; i--) appendLogRow(state.logs[i]);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Devices
+// ─────────────────────────────────────────────────────────────────
+function renderDevices() {
+  const body = $('devBody');
+  const dids = Object.keys(state.devices).sort();
+  $('statDev').textContent = dids.length;
+  if (!dids.length) {
+    body.innerHTML = '<tr><td colspan="12" class="empty">장치 대기 중…</td></tr>';
+    return;
+  }
+  body.innerHTML = dids.map((did) => {
+    const d = state.devices[did];
+    const s = d.lastStatus || {};
+    const prt = d.prt || {};
+    const cfg = d.cfg || {};
+    const isOnline = d.online === true;
+    const rsClass = d.rs === 'on' ? 'rs-on' : 'rs-off';
+    const PRT_SHORT = { ov: '과전압', uv: '부족전압', oc: '과전류', ld: '누설' };
+    const prtHtml = ['ov','uv','oc','ld'].map((k) => {
+      const v = prt[k];
+      const cls = v === true ? 'prt on pulsing' : v === null || v === undefined ? 'prt null' : 'prt';
+      const label = PRT_SHORT[k] || k;
+      const suffix = v === null ? ' (감지 꺼짐)' : v === true ? ' 발생!' : '';
+      return `<span class="${cls}" title="${EVENT_LABEL[k]||k}${suffix}">${label}${v===null?'-':v===true?'!':''}</span>`;
+    }).join('');
+    const cfgStr = `송신 ${cfg.txi ?? '-'}s · 과전류 ${cfg.oc ?? '끔'}${cfg.oc?'A':''} · 지연 ${cfg.ocd ?? '끔'}${cfg.ocd?'s':''} · 누설복귀 ${cfg.lcr ?? '-'}mA`;
+    const flt = d.flt === true ? '<span class="chip fault pulsing" title="기기 자체 이상 (10.5절)">이상!</span>' : d.flt === false ? '<span class="chip" title="정상">정상</span>' : '-';
+    const invBadge = (d.invalidErrCount > 0)
+      ? `<span class="invalid-badge" title="이 장치가 보낸 잘못된 페이로드 err ${d.invalidErrCount}건 · 클릭 시 잘못된 페이로드 탭">⚠ ${d.invalidErrCount}</span>`
+      : (d.invalidCount > 0)
+        ? `<span class="invalid-badge warn" title="warn ${d.invalidCount}건">⚠ ${d.invalidCount}</span>`
+        : '';
+    const cls = [];
+    if (state.selected === did) cls.push('selected');
+    if (state.pinned === did) cls.push('pinned');
+    if (d.flt === true) cls.push('fault');
+    return `
+      <tr class="${cls.join(' ')}" data-did="${did}">
+        <td><span class="did">${did}</span>${invBadge}</td>
+        <td><span class="status-dot ${isOnline?'ok':'err'}"></span></td>
+        <td class="num">${s.v ?? '-'}</td>
+        <td class="num">${s.i ?? '-'}</td>
+        <td class="num">${s.f ?? '-'}</td>
+        <td class="num">${s.pf ?? '-'}</td>
+        <td class="num">${s.lc ?? '-'}</td>
+        <td class="${rsClass}">${d.rs || '-'}</td>
+        <td><div class="prt-cell">${prtHtml}</div></td>
+        <td>${flt}</td>
+        <td style="font-family:Menlo,monospace;font-size:10.5px;color:var(--dim)">${cfgStr}</td>
+        <td title="${d.lastSeen||''}">${ageStr(d.lastSeen)}</td>
+      </tr>`;
+  }).join('');
+  body.querySelectorAll('tr[data-did]').forEach((tr) => {
+    tr.onclick = (e) => {
+      const did = tr.dataset.did;
+      if (e.shiftKey) {
+        state.pinned = state.pinned === did ? null : did;
+        updatePinChip();
+        rerenderLog();
+      } else {
+        state.selected = did;
+        $('cmdDid').value = did;
+        $('fcDid').value = did;
+      }
+      renderDevices(); renderDetail(); renderDiff();
+    };
+  });
+}
+
+function updatePinChip() {
+  if (state.pinned) {
+    $('pinChip').style.display = 'inline-block';
+    $('pinDid').textContent = state.pinned;
+    $('btnUnpin').style.display = 'inline-block';
+    $('statPin').innerHTML = `📌 <b>${state.pinned}</b> 핀`;
+  } else {
+    $('pinChip').style.display = 'none';
+    $('btnUnpin').style.display = 'none';
+    $('statPin').innerHTML = '';
+  }
+}
+
+function renderDetail() {
+  const el = $('detailBody');
+  if (!state.selected) { el.textContent = '장치를 선택하세요.'; return; }
+  const d = state.devices[state.selected];
+  if (!d) { el.textContent = '데이터 없음'; return; }
+  el.innerHTML = highlightJson(d);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Cfg Diff (9.1절)
+// ─────────────────────────────────────────────────────────────────
+async function renderDiff() {
+  const el = $('diffBody');
+  if (!state.selected) { el.innerHTML = '<div class="empty">장치를 선택하세요.</div>'; return; }
+  let desired = null;
+  try {
+    const j = await (await fetch(`${restBase()}/api/devices/${state.selected}`)).json();
+    desired = j.desiredCfg;
+  } catch (e) {}
+  const d = state.devices[state.selected];
+  const reported = d && d.cfg;
+  const keys = ['txi','oc','ocd','lcr'];
+  const KEY_LABEL = { txi: '송신 주기', oc: '과전류 임계', ocd: '과전류 지연', lcr: '누설 복귀' };
+  const KEY_UNIT  = { txi: '초', oc: 'A', ocd: '초', lcr: 'mA' };
+  el.innerHTML = `
+    <div style="padding:10px;color:var(--dim);font-size:11.5px;line-height:1.5">
+      장치 <b>${state.selected}</b> · 서버가 원하는 설정과 장치에 적용된 실제 설정 비교 (명세서 9.1절)
+      ${desired ? '' : ' · <span style="color:var(--err)">서버 조회 실패 (서버 미실행?)</span>'}
+    </div>
+    <table class="diff-table">
+      <thead><tr>
+        <th>설정 항목</th><th class="num">서버가 원함</th><th class="num">장치 실제값</th><th>일치</th><th>동기화</th>
+      </tr></thead>
+      <tbody>
+      ${keys.map((k) => {
+        const a = desired ? (desired[k] === undefined ? null : desired[k]) : '?';
+        const b = reported ? (reported[k] === undefined ? null : reported[k]) : '?';
+        const diff = a !== b && a !== '?' && b !== '?';
+        const unit = KEY_UNIT[k];
+        const fmt = (v) => v === null ? '<span class="null-tok">null (꺼짐)</span>' : v + unit;
+        return `<tr class="diff-row ${diff?'diff':''}" title="${k}">
+          <td>${KEY_LABEL[k]} <span style="color:var(--dim);font-size:10px">(${k})</span></td>
+          <td class="num">${fmt(a)}</td>
+          <td class="num">${fmt(b)}</td>
+          <td>${diff ? '❌ 불일치' : '✓'}</td>
+          <td>${diff ? `<button onclick='resendCfg("${state.selected}","${k}",${JSON.stringify(a)})' title="서버 값을 장치로 다시 전송">서버값 재전송</button>` : ''}</td>
+        </tr>`;
+      }).join('')}
+      </tbody>
+    </table>
+    <div style="padding:10px">
+      <button onclick="resendAllDiff()" title="불일치 항목 전부 한 번에 재전송">불일치 항목 모두 재전송</button>
+      <button onclick="renderDiff()">↻ 새로고침</button>
+    </div>`;
+}
+
+async function resendCfg(did, key, val) {
+  const cfg = { [key]: val };
+  if ((key === 'oc' && val === null) || (key === 'ocd' && val === null)) {
+    cfg.oc = null; cfg.ocd = null;
+  }
+  await postCmd(did, { cfg });
+  setTimeout(renderDiff, 1500);
+}
+async function resendAllDiff() {
+  const j = await (await fetch(`${restBase()}/api/devices/${state.selected}`)).json();
+  if (!j.cfgMismatch || !j.cfgMismatch.length) return toast('cmdResult', '불일치 없음', 'ok');
+  const cfg = {};
+  for (const m of j.cfgMismatch) cfg[m.key] = m.server;
+  await postCmd(state.selected, { cfg });
+  setTimeout(renderDiff, 1500);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Alerts / Acks / Conn / Rate
+// ─────────────────────────────────────────────────────────────────
+function renderAlerts() {
+  const body = $('alertBody');
+  $('tabAlertCount').textContent = state.alerts.length;
+  if (!state.alerts.length) { body.innerHTML = '<div class="empty">이상 이벤트가 아직 없습니다.</div>'; return; }
+  body.innerHTML = state.alerts.map((a) => {
+    const stLabel = a.st === 'active' ? '발생' : '복귀';
+    const stColor = a.st === 'active' ? 'var(--err)' : 'var(--ok)';
+    return `
+    <div class="alert-row ${a.st}">
+      <span style="color:var(--dim)">${a.ts}</span>
+      <span class="did">${a.did}</span>
+      <span class="evt" style="color:${stColor}" title="${a.st==='active'?'이상 발생':'정상 복귀'}">${a.st==='active'?'⚠':'✓'} ${EVENT_LABEL[a.evt]||a.evt} ${stLabel}</span>
+      <span title="측정값 / 판정 임계값 / 릴레이 상태">측정 <b>${a.val}</b> · 기준 <b>${a.th}</b> · 릴레이 ${a.rs||'-'}</span>
+      <span>${a.buffered?`<span class="chip replay" title="재전송된 지연 도착 이벤트">지연 ${a.lagSec}초</span>`:''}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderAcks() {
+  const body = $('ackBody');
+  const cids = Object.keys(state.acks).sort().reverse();
+  $('tabAckCount').textContent = cids.length;
+  if (!cids.length) { body.innerHTML = '<div class="empty">전송된 명령이 없습니다.</div>'; return; }
+  const now = Date.now();
+  body.innerHTML = cids.map((cid) => {
+    const a = state.acks[cid];
+    const kls = !a.result ? 'pending' : a.result === 'success' ? 'ok' : 'fail';
+    const icon = !a.result ? '⋯' : a.result === 'success' ? '✓' : '✗';
+    const label = !a.result ? '응답 대기' : a.result === 'success' ? '성공' : '실패';
+    let rttOrTimer;
+    if (a.result) {
+      rttOrTimer = a.sentAt && a.ackAt ? `${a.ackAt - a.sentAt}ms 소요` : '';
+    } else if (a.sentAt) {
+      const el = now - a.sentAt;
+      const totalMs = ACK_TIMEOUT_MS * (MAX_RETRY + 1);
+      rttOrTimer = `${Math.floor(el/1000)}초 / 최대 ${totalMs/1000}초 대기`;
+    } else rttOrTimer = '';
+    return `
+      <div class="ack-row ${kls}" title="명령 ID: ${cid}">
+        <span>${a.did}</span>
+        <span title="${label}">${icon}</span>
+        <span><span class="cid" title="명령 식별자">${cid}</span> ${a.cmd?escapeHtml(JSON.stringify(a.cmd)):''} ${a.code?'· 오류:'+a.code:''} ${a.message?'· '+escapeHtml(a.message):''}</span>
+        <span>${rttOrTimer}</span>
+      </div>`;
+  }).join('');
+}
+
+function renderPendingCount() {
+  const n = Object.values(state.acks).filter((a) => !a.result).length;
+  $('statPending').textContent = n;
+}
+
+function renderConn() {
+  const body = $('connBody');
+  if (!state.conn.length) { body.innerHTML = '<div class="empty">연결 이벤트가 없습니다.</div>'; return; }
+  body.innerHTML = state.conn.map((e) => `
+    <div class="conn-row ${e.kind}"><span>${e.ts}</span><span>${escapeHtml(e.msg)}</span></div>
+  `).join('');
+}
+
+function renderRate() {
+  const body = $('rateBody');
+  const cutoff = Date.now() - 60000;
+  const stats = {};
+  for (const k of Object.keys(state.rateBuckets)) {
+    state.rateBuckets[k] = state.rateBuckets[k].filter((t) => t > cutoff);
+    stats[k] = state.rateBuckets[k].length;
+  }
+  body.innerHTML = `
+    <div style="padding:10px;color:var(--dim);font-size:11.5px">최근 60초 동안 종류별 메시지 수</div>
+    <div class="rate-bars">
+      <div class="rate-bar"><div class="label">상태값</div><div class="val" style="color:var(--ok)">${stats.status}</div></div>
+      <div class="rate-bar"><div class="label">이상이벤트</div><div class="val" style="color:var(--warn)">${stats.alert}</div></div>
+      <div class="rate-bar"><div class="label">명령</div><div class="val" style="color:var(--purple)">${stats.cmd}</div></div>
+      <div class="rate-bar"><div class="label">응답</div><div class="val" style="color:var(--cyan)">${stats.ack}</div></div>
+      <div class="rate-bar"><div class="label">접속상태</div><div class="val" style="color:var(--dim)">${stats.lwt}</div></div>
+    </div>
+    <div style="padding:10px;color:var(--dim);font-size:11.5px;line-height:1.6">
+      <b>세션 총계:</b> ${state.msgCount} 메시지 · 재접속 ${state.reconnects}회<br>
+      <b>지연 도착 이상이벤트:</b> ${state.alerts.filter((a) => a.buffered).length}건 (통신 두절 후 재전송된 이벤트 · 6.1절)<br>
+      <b>현재 이상 감지 중:</b> ${Object.values(state.devices).filter((d) => d.prt && (d.prt.ov||d.prt.uv||d.prt.oc||d.prt.ld)).length}대<br>
+      <b>현재 기기 자체 이상:</b> ${Object.values(state.devices).filter((d) => d.flt === true).length}대
+    </div>`;
+}
+
+function renderSessionStats() {
+  $('sessionStats').innerHTML = `
+    로그 <b>${state.logs.length}</b>건 · 이상이벤트 <b>${state.alerts.length}</b>건 · 명령응답 <b>${Object.keys(state.acks).length}</b>건<br>
+    접속 장치 <b>${Object.keys(state.devices).length}</b>대 · 접속이력 <b>${state.conn.length}</b>건<br>
+    총 수신 메시지 <b>${state.msgCount}</b> · 서버 재접속 <b>${state.reconnects}</b>회
+  `;
+  $('envInfo').innerHTML = `
+    MQTT 브로커: <b>${$('brokerUrl').value}</b><br>
+    서버 API: <b>${restBase()}</b><br>
+    세션 시작: <b>${new Date(state.connectedAt || Date.now()).toLocaleString('ko-KR')}</b>
+  `;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// CMD sending
+// ─────────────────────────────────────────────────────────────────
+async function postCmd(did, cmd) {
+  const mode = $('cmdMode').value;
+
+  if (mode === 'mqtt') {
+    if (!state.client || !state.client.connected) return toast('cmdResult', 'MQTT 미연결', 'err');
+    const cid = 'CMD-LOCAL-' + Date.now();
+    const payload = { did, ts: new Date().toISOString(), cid, cmd };
+    state.acks[cid] = { cid, did, cmd, sentAt: Date.now() };
+    renderAcks(); renderPendingCount();
+    state.client.publish(`device/${did}/cmd`, JSON.stringify(payload), { qos: 1 });
+    toast('cmdResult', 'MQTT 발행 완료. ack 도착 대기...', 'ok');
+    return;
+  }
+
+  toast('cmdResult', `REST POST /api/devices/${did}/cmd\n\n${JSON.stringify(cmd, null, 2)}\n\n... 응답 대기중`, '');
+  const sentAt = Date.now();
+  try {
+    const r = await fetch(`${restBase()}/api/devices/${did}/cmd`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cmd),
+    });
+    const j = await r.json();
+    if (j.cid) {
+      state.acks[j.cid] = { cid: j.cid, did, cmd, sentAt, result: j.ok ? 'success' : 'fail',
+        code: j.code, message: j.message, ackAt: Date.now() };
+      renderAcks(); renderPendingCount();
+    }
+    toast('cmdResult', 'REST 응답:\n' + JSON.stringify(j, null, 2), j.ok ? 'ok' : 'err');
+    return j;
+  } catch (e) {
+    toast('cmdResult', 'REST 실패: ' + e.message, 'err');
+  }
+}
+
+function sendRelay(s) {
+  const did = $('cmdDid').value.trim();
+  if (!/^[^\s/#+]{1,64}$/.test(did)) return toast('cmdResult', 'DID 형식 오류 (공백/슬래시/#/+ 불가, 1~64자)', 'err');
+  postCmd(did, { rs: s });
+}
+
+function parseCfgVal(raw, key) {
+  const s = raw.trim();
+  if (s === '') return undefined;
+  if (s.toLowerCase() === 'null') return null;
+  const n = Number(s);
+  if (!Number.isFinite(n)) throw new Error(`cfg.${key} 숫자 아님: ${raw}`);
+  return n;
+}
+
+function sendCfg() {
+  const did = $('cmdDid').value.trim();
+  if (!/^[^\s/#+]{1,64}$/.test(did)) return toast('cmdResult', 'DID 형식 오류 (공백/슬래시/#/+ 불가, 1~64자)', 'err');
+  const cfg = {};
+  try {
+    ['txi','oc','ocd','lcr'].forEach((k) => {
+      const v = parseCfgVal($('cfg'+k[0].toUpperCase()+k.slice(1)).value, k);
+      if (v !== undefined) cfg[k] = v;
+    });
+  } catch (e) { return toast('cmdResult', e.message, 'err'); }
+  if (!Object.keys(cfg).length) return toast('cmdResult', '전송할 cfg 값이 없습니다.', 'err');
+  postCmd(did, { cfg });
+}
+
+function sendDisableOc() {
+  const did = $('cmdDid').value.trim();
+  if (!/^[^\s/#+]{1,64}$/.test(did)) return toast('cmdResult', 'DID 형식 오류 (공백/슬래시/#/+ 불가, 1~64자)', 'err');
+  postCmd(did, { cfg: { oc: null, ocd: null } });
+}
+
+function sendRaw() {
+  const did = $('cmdDid').value.trim();
+  if (!/^[^\s/#+]{1,64}$/.test(did)) return toast('cmdResult', 'DID 형식 오류 (공백/슬래시/#/+ 불가, 1~64자)', 'err');
+  let obj;
+  try { obj = JSON.parse($('rawCmd').value); }
+  catch (e) { return toast('cmdResult', 'JSON 파싱 실패: ' + e.message, 'err'); }
+  postCmd(did, obj);
+}
+
+function prettyRaw() {
+  try { $('rawCmd').value = JSON.stringify(JSON.parse($('rawCmd').value), null, 2); }
+  catch (e) { toast('cmdResult', 'JSON 파싱 실패: ' + e.message, 'err'); }
+}
+
+function testValidation() {
+  let obj;
+  try { obj = JSON.parse($('rawCmd').value); }
+  catch (e) { return toast('cmdResult', 'JSON 파싱 실패: ' + e.message, 'err'); }
+  const err = validateCmd(obj);
+  toast('cmdResult', err ? '❌ ' + err : '✓ 클라이언트측 검증 통과 (서버 재검증 필요)', err ? 'err' : 'ok');
+}
+
+function validateCmd(cmd) {
+  if (!cmd || typeof cmd !== 'object' || Array.isArray(cmd)) return 'cmd는 객체여야 합니다';
+  for (const k of Object.keys(cmd)) if (k !== 'rs' && k !== 'cfg') return `UNKNOWN_KEY: cmd.${k}`;
+  if (cmd.rs === undefined && cmd.cfg === undefined) return 'rs 또는 cfg 중 하나 필수';
+  if (cmd.rs !== undefined && cmd.rs !== 'on' && cmd.rs !== 'off') return 'INVALID_RANGE: rs는 "on"/"off"만';
+  if (cmd.cfg !== undefined) {
+    if (!cmd.cfg || typeof cmd.cfg !== 'object') return 'cfg는 객체여야 합니다';
+    for (const [k, v] of Object.entries(cmd.cfg)) {
+      const r = RANGE[k];
+      if (!r) return `UNKNOWN_KEY: cfg.${k}`;
+      if (v === null) { if (!r.nullable) return `INVALID_TYPE: cfg.${k}는 null 불가`; continue; }
+      if (typeof v !== 'number' || !Number.isFinite(v)) return `INVALID_TYPE: cfg.${k} 숫자 아님`;
+      if (r.int && !Number.isInteger(v)) return `INVALID_TYPE: cfg.${k}는 정수`;
+      if (v < r.min || v > r.max) return `INVALID_RANGE: cfg.${k}는 ${r.min}~${r.max}`;
+    }
+  }
+  return null;
+}
+
+function loadCfgFromDevice() {
+  const did = state.selected || $('cmdDid').value.trim();
+  const d = state.devices[did];
+  if (!d || !d.cfg) return toast('cmdResult', '선택 장치의 cfg 없음', 'err');
+  $('cfgTxi').value = d.cfg.txi ?? '';
+  $('cfgOc').value  = d.cfg.oc === null ? 'null' : (d.cfg.oc ?? '');
+  $('cfgOcd').value = d.cfg.ocd === null ? 'null' : (d.cfg.ocd ?? '');
+  $('cfgLcr').value = d.cfg.lcr ?? '';
+  toast('cmdResult', `장치 ${did} cfg 로드됨`, 'ok');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// REST utils
+// ─────────────────────────────────────────────────────────────────
+async function fetchSpec() {
+  try { toast('cmdResult', JSON.stringify(await (await fetch(`${restBase()}/api/spec`)).json(), null, 2), 'ok'); }
+  catch (e) { toast('cmdResult', '실패: ' + e.message, 'err'); }
+}
+async function fetchDevices() {
+  try {
+    const j = await (await fetch(`${restBase()}/api/devices`)).json();
+    (j.devices || []).forEach((d) => {
+      const dev = ensureDev(d.did);
+      dev.online = d.online; dev.lastSeen = d.lastSeen;
+      dev.rs = d.rs; dev.cfg = d.reportedCfg;
+      dev.flt = d.flt;
+      if (d.protection) dev.prt = d.protection;
+      if (d.measure) dev.lastStatus = { ...d.measure, prt: d.protection, cfg: d.reportedCfg, flt: d.flt };
+    });
+    renderDevices();
+    toast('cmdResult', `장치 ${j.devices?.length||0}개 로드`, 'ok');
+  } catch (e) { toast('cmdResult', '실패: ' + e.message, 'err'); }
+}
+async function fetchDevice() {
+  const did = state.selected || $('cmdDid').value.trim();
+  try { toast('cmdResult', JSON.stringify(await (await fetch(`${restBase()}/api/devices/${did}`)).json(), null, 2), 'ok'); }
+  catch (e) { toast('cmdResult', '실패: ' + e.message, 'err'); }
+}
+async function fetchAlerts() {
+  const did = state.selected || $('cmdDid').value.trim();
+  try { toast('cmdResult', JSON.stringify(await (await fetch(`${restBase()}/api/devices/${did}/alerts?limit=50`)).json(), null, 2), 'ok'); }
+  catch (e) { toast('cmdResult', '실패: ' + e.message, 'err'); }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Manual publish
+// ─────────────────────────────────────────────────────────────────
+function manualPublish() {
+  if (!state.client || !state.client.connected) return alert('MQTT 미연결');
+  const topic = $('mpTopic').value.trim();
+  const payload = $('mpPayload').value;
+  const qos = Number($('mpQos').value);
+  const retain = $('mpRetain').checked;
+  if (!topic) return alert('topic 필요');
+  state.client.publish(topic, payload, { qos, retain });
+  connLog('conn', `Manual publish → ${topic} (Q${qos}${retain?' R':''}, ${payload.length}B)`);
+}
+function prettyManual() {
+  try { $('mpPayload').value = JSON.stringify(JSON.parse($('mpPayload').value), null, 2); }
+  catch (e) { alert('JSON 파싱 실패: ' + e.message); }
+}
+function loadPreset(name) {
+  const did = $('cmdDid').value.trim() || '0001';
+  const presets = {
+    'status': {
+      topic: `device/${did}/status`,
+      payload: JSON.stringify({
+        did, ts: new Date().toISOString(),
+        d: { v: 220.5, i: 5.12, f: 59.98, pf: 0.95, lc: 12,
+             rs: 'on', prt: { ov: false, uv: false, oc: null, ld: false },
+             cfg: { txi: 10, oc: null, ocd: null, lcr: 17 } }
+      }, null, 2),
+    },
+    'alert': {
+      topic: `device/${did}/alert`,
+      payload: JSON.stringify({
+        did, ts: new Date().toISOString(),
+        evt: 'ld', st: 'active', val: 22.4, th: 20, rs: 'on'
+      }, null, 2),
+    },
+    'lwt-off': {
+      topic: `device/${did}/lwt`,
+      payload: JSON.stringify({ did, st: 'offline' }, null, 2),
+    },
+    'badjson': {
+      topic: `device/${did}/cmd`,
+      payload: '{this is not json,,,'
+    },
+  };
+  const p = presets[name];
+  if (!p) return;
+  $('mpTopic').value = p.topic;
+  $('mpPayload').value = p.payload;
+  if (name === 'lwt-off') $('mpRetain').checked = true;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Fail-code tests
+// ─────────────────────────────────────────────────────────────────
+async function fcSend(label, cmd, didOverride) {
+  const did = didOverride || $('fcDid').value.trim();
+  if (!/^[^\s/#+]{1,64}$/.test(did)) return toast('fcResult', 'DID 형식 오류 (공백/슬래시/#/+ 불가, 1~64자)', 'err');
+  toast('fcResult', `[${label}]\nPOST /api/devices/${did}/cmd\n${JSON.stringify(cmd, null, 2)}\n\n... 대기중`, '');
+  const sentAt = Date.now();
+  try {
+    const j = await (await fetch(`${restBase()}/api/devices/${did}/cmd`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cmd),
+    })).json();
+    if (j.cid) {
+      state.acks[j.cid] = { cid: j.cid, did, cmd, sentAt, result: j.ok ? 'success' : 'fail',
+        code: j.code, message: j.message, ackAt: Date.now() };
+      renderAcks(); renderPendingCount();
+    }
+    toast('fcResult', `[${label}]\n소요: ${Date.now()-sentAt}ms\n\n` + JSON.stringify(j, null, 2), j.ok ? 'ok' : 'err');
+  } catch (e) { toast('fcResult', '실패: ' + e.message, 'err'); }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Session
+// ─────────────────────────────────────────────────────────────────
+function doExport() {
+  const blob = new Blob([JSON.stringify({
+    exportedAt: new Date().toISOString(),
+    devices: state.devices, logs: state.logs, alerts: state.alerts,
+    acks: state.acks, conn: state.conn, msgCount: state.msgCount,
+    reconnects: state.reconnects,
+  }, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `devmon-${Date.now()}.json`;
+  a.click();
+}
+function doClear() {
+  if (!confirm('세션 전체 초기화?')) return;
+  state.logs.length = 0; state.alerts.length = 0; state.acks = {};
+  state.conn.length = 0; state.msgCount = 0; state.reconnects = 0;
+  state.devices = {}; state.rateBuckets = { status:[], alert:[], cmd:[], ack:[], lwt:[] };
+  state.invalidLogs.length = 0; state.invalidCount = 0; state.invalidErrCount = 0;
+  $('statInvalid').textContent = 0; $('statInvalidWarn').textContent = 0;
+  rerenderLog(); renderAlerts(); renderAcks(); renderConn();
+  renderDevices(); renderPendingCount(); renderInvalid();
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Tabs
+// ─────────────────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('#tabs .tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('#tab-log,#tab-alerts,#tab-acks,#tab-detail,#tab-diff,#tab-conn,#tab-rate,#tab-invalid')
+    .forEach((b) => b.classList.toggle('active', b.id === 'tab-' + name));
+  if (name === 'diff') renderDiff();
+  if (name === 'rate') renderRate();
+  if (name === 'invalid') renderInvalid();
+}
+
+function renderInvalid() {
+  const el = $('invalidBody');
+  const list = state.invalidLogs;
+  $('tabInvalidCount').textContent = list.length;
+  if (!list.length) { el.innerHTML = '<div class="empty">검증 실패한 페이로드가 아직 없습니다.</div>'; return; }
+  el.innerHTML = `
+    <div style="padding:8px 10px;color:var(--dim);font-size:11.5px;line-height:1.5">
+      최근 <b>${list.length}</b>건 표시 (최대 ${MAX_INVALID}건 보관) · 세션 누적
+      <b style="color:var(--err)">오류 ${state.invalidErrCount}</b> · <b style="color:var(--warn)">경고 ${state.invalidCount - state.invalidErrCount}</b>건
+      &nbsp;<button onclick="state.invalidLogs.length=0;state.invalidCount=0;state.invalidErrCount=0;$('statInvalid').textContent=0;$('statInvalidWarn').textContent=0;renderInvalid();renderDevices()" title="이 탭의 기록만 지웁니다">🗑 이 탭 지우기</button>
+      <div style="margin-top:4px">📖 <b>오류(err)</b>: 명세서 위반 (반드시 수정 필요) · <b>경고(warn)</b>: 명세서 위반은 아니지만 확인 권장</div>
+    </div>
+    ${list.map((e) => {
+      const level = e.hasErr ? 'err' : 'warn';
+      return `
+      <div class="log-row invalid-${level}">
+        <span class="ts">${e.ts}</span>
+        <span class="did">${e.did}</span>
+        <span><span class="chip ${e.kind||'sys'}">${e.kind||'sys'}</span></span>
+        <span class="payload">
+          <div style="color:var(--dim);font-size:10.5px">topic: ${escapeHtml(e.topic)}</div>
+          <div class="issue-list ${e.hasErr?'':'warn-only'}">
+            ${e.issues.map((x) => `<div class="issue-item ${x.level}"><b>${escapeHtml(x.field)}</b> — ${escapeHtml(x.msg)}</div>`).join('')}
+          </div>
+          <details style="margin-top:4px"><summary style="cursor:pointer;font-size:10.5px;color:var(--dim)">▼ 원본 데이터 보기</summary>
+            <div style="margin-top:4px">${e.error ? escapeHtml(e.raw||'') : highlightJson(e.payload)}</div>
+          </details>
+        </span>
+      </div>`;
+    }).join('')}
+  `;
+}
+function switchRTab(name) {
+  document.querySelectorAll('#rTabs .tab').forEach((t) => t.classList.toggle('active', t.dataset.rtab === name));
+  document.querySelectorAll('#rtab-cmd,#rtab-manual,#rtab-failcode,#rtab-session')
+    .forEach((b) => b.classList.toggle('active', b.id === 'rtab-' + name));
+  if (name === 'session') renderSessionStats();
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Wire up
+// ─────────────────────────────────────────────────────────────────
+$('btnConnect').onclick = connect;
+$('btnDisconnect').onclick = disconnect;
+$('btnPause').onclick = () => {
+  state.paused = !state.paused;
+  $('btnPause').textContent = state.paused ? '▶' : '⏸';
+};
+$('btnClearLog').onclick = () => { state.logs.length = 0; $('logBody').innerHTML = ''; };
+$('btnExport').onclick = doExport;
+$('btnRefreshDevs').onclick = fetchDevices;
+$('btnUnpin').onclick = () => { state.pinned = null; updatePinChip(); rerenderLog(); renderDevices(); };
+$('filterInput').oninput = rerenderLog;
+['chkStatus','chkAlert','chkCmd','chkAck','chkLwt','chkOnlyInvalid'].forEach((id) => $(id).onchange = rerenderLog);
+document.querySelectorAll('#tabs .tab').forEach((t) => t.onclick = () => switchTab(t.dataset.tab));
+document.querySelectorAll('#rTabs .tab').forEach((t) => t.onclick = () => switchRTab(t.dataset.rtab));
+
+// 1초 주기: stat 갱신, rate 갱신
+setInterval(() => {
+  const cutoff = Date.now() - 1000;
+  state.msgWindow = state.msgWindow.filter((t) => t > cutoff);
+  $('statMsg').textContent = state.msgCount;
+  $('statRate').textContent = state.msgWindow.length;
+  if (state.connectedAt) {
+    const s = Math.floor((Date.now() - state.connectedAt) / 1000);
+    $('statUptime').textContent = s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s/60)}m${s%60}s` : `${Math.floor(s/3600)}h`;
+  }
+  renderDevices();
+  renderAcks();
+  if (document.getElementById('tab-rate').classList.contains('active')) renderRate();
+  if (document.getElementById('rtab-session').classList.contains('active')) renderSessionStats();
+}, 1000);
+
+// 자동 연결
+connect();
+</script>
+
+</body>
+</html>
