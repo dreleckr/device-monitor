@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <title>Device Monitor v2 — rev2 상세 디버깅</title>
-  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <script async src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
   <style>
     :root {
       --bg: #0f1420; --panel: #171d2d; --panel2: #1e2538; --line: #2a3350;
@@ -366,15 +366,13 @@
         </div>
         <span class="spacer"></span>
       </div>
+<div class="form" style="padding:10px 12px;border-bottom:1px solid var(--border)"><div class="row"><label for="cmdDid">대상 장치 ID</label><input type="text" id="cmdDid" value="0001" pattern="[^\s/#+]{1,64}"><button onclick="selectInputTarget()">적용</button></div><div class="hint">서버 미연결 시 예시 데이터를 화면에만 반영하며, 측정값은 2초마다 소폭 변동합니다.</div><div id="targetResult" class="hint" role="status"></div></div>
       <div class="body">
 
         <!-- CMD TAB -->
         <div id="rtab-cmd" class="tab-body active">
           <div class="form">
-            <div class="row">
-              <label title="명령을 받을 장치 ID">대상 장치 ID</label>
-              <input type="text" id="cmdDid" value="0001" pattern="[^\s/#+]{1,64}" title="장치 ID (문자열, 공백/슬래시/#/+ 불가)">
-            </div>
+
             <div class="row">
               <label title="REST: 서버가 응답까지 추적 · MQTT: 직접 발행(개발용)">전송 방식</label>
               <select id="cmdMode">
@@ -802,6 +800,7 @@ function toast(target, msg, kind) {
 // MQTT
 // ─────────────────────────────────────────────────────────────────
 function connect() {
+  if(typeof mqtt==='undefined')return alert('통신 라이브러리를 불러오지 못했습니다. 대상 장치 입력 기능은 이용할 수 있습니다.');
   const url = $('brokerUrl').value.trim();
   if (state.client) { state.client.end(true); state.client = null; }
 
@@ -845,71 +844,7 @@ function connect() {
     connLog('err', `오류: ${e.message}`);
   });
 
-  client.on('message', (topic, buf, packet) => {
-    if (state.paused) return;
-    const raw = buf.toString();
-    const t = parseTopic(topic);
-    let body = null, parseErr = null;
-    try { body = JSON.parse(raw); } catch (e) { parseErr = e.message; }
-
-    const recvAt = new Date().toISOString();
-    let lagSec = 0, buffered = false;
-    if (body && body.ts && (t?.kind === 'alert' || t?.kind === 'status')) {
-      lagSec = Math.floor((Date.now() - Date.parse(body.ts)) / 1000);
-      if (t.kind === 'alert' && lagSec > LAG_WARN_SEC) buffered = true;
-    }
-
-    // 페이로드 검증 (실장비 잘못된 값 감지)
-    let issues = [];
-    if (parseErr) {
-      issues = [{ level: 'err', field: '(json)', msg: 'JSON 파싱 실패: ' + parseErr }];
-    } else if (!t) {
-      issues = [{ level: 'err', field: '(topic)', msg: `알 수 없는 토픽 규칙: "${topic}" (device/{did}/{status|alert|cmd|ack|lwt} 형식이어야 함)` }];
-    } else {
-      issues = validatePayload(t.kind, body, t.did);
-    }
-    const hasErr  = issues.some((x) => x.level === 'err');
-    const hasWarn = issues.some((x) => x.level === 'warn');
-
-    const entry = {
-      ts: nowHms(), recvAt, topic, kind: t ? t.kind : 'unknown',
-      did: t ? t.did : '-', payload: body, raw,
-      retain: packet.retain, qos: packet.qos,
-      error: !!parseErr, parseErr,
-      lagSec, buffered,
-      issues, hasErr, hasWarn,
-    };
-    pushLog(entry);
-    if (t) state.rateBuckets[t.kind]?.push(Date.now());
-
-    // 검증 이슈 집계 (장치별 · 세션 누적)
-    if (issues.length) {
-      state.invalidCount++;
-      if (hasErr) state.invalidErrCount++;
-      state.invalidLogs.unshift(entry);
-      if (state.invalidLogs.length > MAX_INVALID) state.invalidLogs.length = MAX_INVALID;
-      if (t) {
-        const dev = ensureDev(t.did);
-        dev.invalidCount = (dev.invalidCount || 0) + 1;
-        if (hasErr) dev.invalidErrCount = (dev.invalidErrCount || 0) + 1;
-        dev.lastInvalidAt = recvAt;
-      }
-      // 헤더 카운터 즉시 갱신 + 연결로그
-      $('statInvalid').textContent = state.invalidErrCount;
-      $('statInvalidWarn').textContent = state.invalidCount - state.invalidErrCount;
-      if (hasErr) connLog('err', `[${t?t.did:'-'}] ${t?t.kind:'?'} 검증 실패: ${issues.filter(x=>x.level==='err').map(x=>x.field+' '+x.msg).join(' | ')}`);
-    }
-
-    if (parseErr || !t) return;
-
-    switch (t.kind) {
-      case 'status': applyStatus(t.did, body); break;
-      case 'alert':  applyAlert(t.did, body, entry); break;
-      case 'lwt':    applyLwt(t.did, body); break;
-      case 'ack':    applyAck(t.did, body); break;
-      case 'cmd':    /* server publishes */ break;
-    }
-  });
+  client.on('message', receiveMonitorMessage);
 
   state.client = client;
 }
@@ -1163,6 +1098,7 @@ function renderDetail() {
 // ─────────────────────────────────────────────────────────────────
 async function renderDiff() {
   const el = $('diffBody');
+  if(!state.client?.connected){el.innerHTML='<div class="empty">서버 연결 후 설정값을 비교할 수 있습니다.</div>';return;}
   if (!state.selected) { el.innerHTML = '<div class="empty">장치를 선택하세요.</div>'; return; }
   let desired = null;
   try {
@@ -1560,6 +1496,7 @@ async function fcSend(label, cmd, didOverride) {
 // ─────────────────────────────────────────────────────────────────
 function doExport() {
   const blob = new Blob([JSON.stringify({
+    directlyEnteredDeviceIds: [...directlyEnteredDevices],
     exportedAt: new Date().toISOString(),
     devices: state.devices, logs: state.logs, alerts: state.alerts,
     acks: state.acks, conn: state.conn, msgCount: state.msgCount,
@@ -1666,8 +1603,180 @@ setInterval(() => {
   if (document.getElementById('rtab-session').classList.contains('active')) renderSessionStats();
 }, 1000);
 
-// 자동 연결
-connect();
+function receiveMonitorMessage(topic, buf, packet) {
+    if (state.paused) return;
+    const raw = buf.toString();
+    const t = parseTopic(topic);
+    let body = null, parseErr = null;
+    try { body = JSON.parse(raw); } catch (e) { parseErr = e.message; }
+
+    const recvAt = new Date().toISOString();
+    let lagSec = 0, buffered = false;
+    if (body && body.ts && (t?.kind === 'alert' || t?.kind === 'status')) {
+      lagSec = Math.floor((Date.now() - Date.parse(body.ts)) / 1000);
+      if (t.kind === 'alert' && lagSec > LAG_WARN_SEC) buffered = true;
+    }
+
+    // 페이로드 검증 (실장비 잘못된 값 감지)
+    let issues = [];
+    if (parseErr) {
+      issues = [{ level: 'err', field: '(json)', msg: 'JSON 파싱 실패: ' + parseErr }];
+    } else if (!t) {
+      issues = [{ level: 'err', field: '(topic)', msg: `알 수 없는 토픽 규칙: "${topic}" (device/{did}/{status|alert|cmd|ack|lwt} 형식이어야 함)` }];
+    } else {
+      issues = validatePayload(t.kind, body, t.did);
+    }
+    const hasErr  = issues.some((x) => x.level === 'err');
+    const hasWarn = issues.some((x) => x.level === 'warn');
+
+    const entry = {
+      ts: nowHms(), recvAt, topic, kind: t ? t.kind : 'unknown',
+      did: t ? t.did : '-', payload: body, raw,
+      retain: packet.retain, qos: packet.qos,
+      error: !!parseErr, parseErr,
+      lagSec, buffered,
+      issues, hasErr, hasWarn,
+    };
+    pushLog(entry);
+    if (t) state.rateBuckets[t.kind]?.push(Date.now());
+
+    // 검증 이슈 집계 (장치별 · 세션 누적)
+    if (issues.length) {
+      state.invalidCount++;
+      if (hasErr) state.invalidErrCount++;
+      state.invalidLogs.unshift(entry);
+      if (state.invalidLogs.length > MAX_INVALID) state.invalidLogs.length = MAX_INVALID;
+      if (t) {
+        const dev = ensureDev(t.did);
+        dev.invalidCount = (dev.invalidCount || 0) + 1;
+        if (hasErr) dev.invalidErrCount = (dev.invalidErrCount || 0) + 1;
+        dev.lastInvalidAt = recvAt;
+      }
+      // 헤더 카운터 즉시 갱신 + 연결로그
+      $('statInvalid').textContent = state.invalidErrCount;
+      $('statInvalidWarn').textContent = state.invalidCount - state.invalidErrCount;
+      if (hasErr) connLog('err', `[${t?t.did:'-'}] ${t?t.kind:'?'} 검증 실패: ${issues.filter(x=>x.level==='err').map(x=>x.field+' '+x.msg).join(' | ')}`);
+    }
+
+    if (parseErr || !t) return;
+
+    switch (t.kind) {
+      case 'status': applyStatus(t.did, body); break;
+      case 'alert':  applyAlert(t.did, body, entry); break;
+      case 'lwt':    applyLwt(t.did, body); break;
+      case 'ack':    applyAck(t.did, body); break;
+      case 'cmd':    /* server publishes */ break;
+    }
+  }
+
+function injectLocal(kind, did, data) {
+  receiveMonitorMessage(`device/${did}/${kind}`, {toString:()=>JSON.stringify(data)}, {retain:false,qos:1});
+  $('statMsg').textContent = state.msgCount;
+}
+const localOnMeasurements = new Map();
+function normalizeLocalRelay(did,d){
+  if(d.rs==='off'){
+    if(d.i!==0 || d.lc!==0 || d.pf!==0)localOnMeasurements.set(did,{i:d.i,lc:d.lc,pf:d.pf});
+    d.i=0;d.lc=0;d.pf=0;
+  }else{
+    localOnMeasurements.set(did,{i:d.i,lc:d.lc,pf:d.pf});
+  }
+  return d;
+}
+function localStatus(did, patch={}) {
+  const old=state.devices[did]?.lastStatus;
+  const d=old ? JSON.parse(JSON.stringify(old)) : {
+    v:220.5,i:5.12,f:59.98,pf:0.95,lc:12,rs:'on',
+    prt:{ov:false,uv:false,oc:false,ld:false},
+    cfg:{txi:10,oc:10,ocd:5,lcr:17},flt:false
+  };
+  Object.assign(d,patch);
+  normalizeLocalRelay(did,d);
+  injectLocal('status',did,{did,ts:new Date().toISOString(),d});
+}
+
+
+const directlyEnteredDevices=new Set();
+const originalManualPublish=manualPublish;
+const originalPostCmd=postCmd;
+function isLocalInput(){return !state.client?.connected;}
+function selectInputTarget(){
+  const did=$('cmdDid').value.trim();
+  if(!/^[^\s/#+]{1,64}$/.test(did))return toast('targetResult','장치 ID를 확인하세요.','err');
+  if(isLocalInput()){
+    directlyEnteredDevices.add(did);
+    if(!state.devices[did])localStatus(did);
+  }else if(!state.devices[did])return toast('targetResult','아직 데이터를 수신하지 않은 장치입니다.','');
+  state.selected=did;$('fcDid').value=did;$('mpTopic').value=`device/${did}/status`;
+  renderDevices();renderDetail();renderDiff();
+  toast('targetResult',isLocalInput()?'예시 장치 '+did+' 선택 · 화면 내부 반영':'대상 장치 '+did+' 선택','ok');
+}
+manualPublish=function(){
+  if(!isLocalInput())return originalManualPublish();
+  const topic=$('mpTopic').value.trim(),t=parseTopic(topic);
+  if(!t)return alert('device/{장치ID}/status 형식의 토픽을 입력하세요.');
+  if(!['status','alert','lwt'].includes(t.kind))return alert('서버 미연결 시 status, alert, lwt를 화면에 반영할 수 있습니다.');
+  let data;try{data=JSON.parse($('mpPayload').value);}catch(e){return alert('JSON 형식을 확인하세요.');}
+  const issues=validatePayload(t.kind,data,t.did).filter(x=>x.level==='err');
+  if(issues.length)return alert(issues.map(x=>x.field+': '+x.msg).join('\n'));
+  state.paused=false;$('btnPause').textContent='⏸';
+  if(t.kind==='status'){
+    localVariationBase.delete(t.did);
+    normalizeLocalRelay(t.did,data.d);
+  }
+  directlyEnteredDevices.add(t.did);injectLocal(t.kind,t.did,data);
+  connLog('conn','직접 입력 → '+topic+' · 화면 내부 반영, 서버 전송 없음');
+};
+postCmd=async function(did,cmd){
+  if(!isLocalInput())return originalPostCmd(did,cmd);
+  const error=validateCmd(cmd);if(error)return toast('cmdResult',error,'err');
+  directlyEnteredDevices.add(did);
+  if(!state.devices[did])localStatus(did);
+  const d=state.devices[did].lastStatus;
+  const patch={};
+  if(cmd.rs!==undefined){
+    patch.rs=cmd.rs;
+    if(cmd.rs==='off' && d.rs==='on')localOnMeasurements.set(did,{i:d.i,lc:d.lc,pf:d.pf});
+    if(cmd.rs==='on' && d.rs==='off'){
+      Object.assign(patch,localOnMeasurements.get(did)||{i:0,lc:0,pf:0});
+      localVariationBase.delete(did);
+    }
+  }
+  if(cmd.cfg){patch.cfg={...d.cfg,...cmd.cfg};patch.prt={...d.prt,oc:patch.cfg.oc===null||patch.cfg.ocd===null?null:false};}
+  localStatus(did,patch);state.selected=did;renderDevices();renderDetail();
+  toast('cmdResult','입력한 내용을 화면에 반영했습니다. 서버 전송 및 실장비 제어는 수행하지 않았습니다.','ok');
+  return {ok:true,mode:'local-input'};
+};
+
+
+// Small bounded variations of directly entered example values only.
+const localVariationBase=new Map();
+let localVariationTick=0;
+function refreshLocalMeasurements(){
+  if(!isLocalInput() || state.paused)return;
+  localVariationTick++;
+  for(const did of directlyEnteredDevices){
+    const device=state.devices[did];
+    if(!device?.lastStatus){localVariationBase.delete(did);continue;}
+    if(device.online===false)continue;
+    if(!localVariationBase.has(did))localVariationBase.set(did,{...device.lastStatus});
+    const base=localVariationBase.get(did), patch={};
+    const wave=Math.sin(localVariationTick*.83+Array.from(did).reduce((n,c)=>n+c.charCodeAt(0),0));
+    for(const [key,amount,digits,min,max] of [
+      ['v',.4,1,0,1000],['i',.04,2,0,10000],['f',.02,2,0,1000],
+      ['pf',.003,3,-1,1],['lc',.2,2,0,10000]
+    ]){
+      if(device.rs==='off' && ['i','lc','pf'].includes(key)){patch[key]=0;continue;}
+      const v=base[key];
+      if(typeof v!=='number'||!Number.isFinite(v))continue;
+      const amp=Math.min(amount,Math.abs(v)*.01);
+      patch[key]=Number(Math.max(min,Math.min(max,v+amp*wave)).toFixed(digits));
+    }
+    localStatus(did,patch);
+  }
+}
+setInterval(refreshLocalMeasurements,2000);
+
 </script>
 
 </body>
